@@ -27,12 +27,13 @@
     }
     \item{\code{singletons} - for internal use}
     \item{\code{url_protocol}, \code{url_hostname}, \code{url_port},
-      \code{url_pathname}, \code{url_search}, and \code{url_hash_initial}
-      can be used to get the components of the URL that was requested by the
-      browser to load the Shiny app page. These values are from the
-      browser's perspective, so neither HTTP proxies nor Shiny Server will
-      affect these values. The \code{url_search} value may be used with
-      \code{\link{parseQueryString}} to access query string parameters.
+      \code{url_pathname}, \code{url_search}, \code{url_hash_initial}
+      and \code{url_hash} can be used to get the components of the URL
+      that was requested by the browser to load the Shiny app page.
+      These values are from the browser's perspective, so neither HTTP
+      proxies nor Shiny Server will affect these values. The
+      \code{url_search} value may be used with \code{\link{parseQueryString}}
+      to access query string parameters.
     }
   }
   \code{clientData} also contains information about each output.
@@ -102,6 +103,10 @@
   This is the request that was used to initiate the websocket connection
   (as opposed to the request that downloaded the web page for the app).
 }
+\item{userData}{
+  An environment for app authors and module/package authors to store whatever
+  session-specific data they want.
+}
 \item{resetBrush(brushId)}{
   Resets/clears the brush with the given \code{brushId}, if it exists on
   any \code{imageOutput} or \code{plotOutput} in the app.
@@ -122,7 +127,8 @@
   Similar to \code{sendCustomMessage}, but the message must be a raw vector
   and the registration method on the client is
   \code{Shiny.addBinaryMessageHandler(type, function(message){...})}. The
-  message argument on the client will be a \href{https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/DataView}{DataView}.
+  message argument on the client will be a
+  \href{https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/DataView}{DataView}.
 }
 \item{sendInputMessage(inputId, message)}{
   Sends a message to an input on the session's client web page; if the input
@@ -177,4 +183,3 @@ relating to the session. The following list describes the items available
 in the environment; they can be accessed using the \code{$} operator (for
 example, \code{session$clientData$url_search}).
 }
-

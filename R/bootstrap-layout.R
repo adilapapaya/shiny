@@ -277,6 +277,7 @@ titlePanel <- function(title, windowTitle=title) {
 #' @examples
 #' ## Only run examples in interactive R sessions
 #' if (interactive()) {
+#' options(device.ask.default = FALSE)
 #'
 #' # Define UI
 #' ui <- fluidPage(
@@ -442,6 +443,7 @@ inputPanel <- function(...) {
 #' @examples
 #' ## Only run examples in interactive R sessions
 #' if (interactive()) {
+#' options(device.ask.default = FALSE)
 #'
 #' # Server code used for all examples
 #' server <- function(input, output) {
@@ -586,7 +588,7 @@ flexfill <- function(..., direction, flex, width = width, height = height) {
   }
 
   if (length(flex) > length(children)) {
-    flex <- flex[1:length(children)]
+    flex <- flex[seq_along(children)]
   }
 
   # The dimension along the main axis

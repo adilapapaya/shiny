@@ -1,6 +1,7 @@
 #' @include server-input-handlers.R
 
 appsByToken <- Map$new()
+appsNeedingFlush <- Map$new()
 
 # Provide a character representation of the WS that can be used
 # as a key in a Map.
@@ -21,7 +22,7 @@ registerClient <- function(client) {
 }
 
 
-.globals$resources <- list()
+.globals$resourcePaths <- list()
 
 .globals$showcaseDefault <- 0
 
@@ -34,16 +35,11 @@ registerClient <- function(client) {
 #' JavaScript/CSS files available to their components.
 #'
 #' @param prefix The URL prefix (without slashes). Valid characters are a-z,
-#'   A-Z, 0-9, hyphen, period, and underscore; and must begin with a-z or A-Z.
+#'   A-Z, 0-9, hyphen, period, and underscore.
 #'   For example, a value of 'foo' means that any request paths that begin with
 #'   '/foo' will be mapped to the given directory.
 #' @param directoryPath The directory that contains the static resources to be
 #'   served.
-#'
-#' @details You can call \code{addResourcePath} multiple times for a given
-#'   \code{prefix}; only the most recent value will be retained. If the
-#'   normalized \code{directoryPath} is different than the directory that's
-#'   currently mapped to the \code{prefix}, a warning will be issued.
 #'
 #' @seealso \code{\link{singleton}}
 #'
@@ -52,46 +48,29 @@ registerClient <- function(client) {
 #' @export
 addResourcePath <- function(prefix, directoryPath) {
   prefix <- prefix[1]
-  if (!grepl('^[a-z][a-z0-9\\-_.]*$', prefix, ignore.case=TRUE, perl=TRUE)) {
+  if (!grepl('^[a-z0-9\\-_][a-z0-9\\-_.]*$', prefix, ignore.case = TRUE, perl = TRUE)) {
     stop("addResourcePath called with invalid prefix; please see documentation")
   }
-
   if (prefix %in% c('shared')) {
     stop("addResourcePath called with the reserved prefix '", prefix, "'; ",
          "please use a different prefix")
   }
+  normalizedPath <- tryCatch(normalizePath(directoryPath, mustWork = TRUE),
+    error = function(e) {
+      stop("Couldn't normalize path in `addResourcePath`, with arguments: ",
+        "`prefix` = '", prefix, "'; `directoryPath` = '" , directoryPath, "'")
+    }
+  )
 
-  directoryPath <- normalizePath(directoryPath, mustWork=TRUE)
+  # If a shiny app is currently running, dynamically register this path with
+  # the corresponding httpuv server object.
+  if (!is.null(getShinyOption("server")))
+  {
+    getShinyOption("server")$setStaticPath(.list = stats::setNames(normalizedPath, prefix))
+  }
 
-  existing <- .globals$resources[[prefix]]
-
-  .globals$resources[[prefix]] <- list(directoryPath=directoryPath,
-                                       func=staticHandler(directoryPath))
-}
-
-resourcePathHandler <- function(req) {
-  if (!identical(req$REQUEST_METHOD, 'GET'))
-    return(NULL)
-
-  path <- req$PATH_INFO
-
-  match <- regexpr('^/([^/]+)/', path, perl=TRUE)
-  if (match == -1)
-    return(NULL)
-  len <- attr(match, 'capture.length')
-  prefix <- substr(path, 2, 2 + len - 1)
-
-  resInfo <- .globals$resources[[prefix]]
-  if (is.null(resInfo))
-    return(NULL)
-
-  suffix <- substr(path, 2 + len, nchar(path))
-
-  subreq <- as.environment(as.list(req, all.names=TRUE))
-  subreq$PATH_INFO <- suffix
-  subreq$SCRIPT_NAME <- paste(subreq$SCRIPT_NAME, substr(path, 1, 2 + len), sep='')
-
-  return(resInfo$func(subreq))
+  # .globals$resourcePaths persists across runs of applications.
+  .globals$resourcePaths[[prefix]] <- normalizedPath
 }
 
 #' Define Server Functionality
@@ -155,7 +134,7 @@ decodeMessage <- function(data) {
     # Treat message as UTF-8
     charData <- rawToChar(data)
     Encoding(charData) <- 'UTF-8'
-    return(jsonlite::fromJSON(charData, simplifyVector=FALSE))
+    return(safeFromJSON(charData, simplifyVector=FALSE))
   }
 
   i <- 5
@@ -179,23 +158,19 @@ createAppHandlers <- function(httpHandlers, serverFuncSource) {
   appvars <- new.env()
   appvars$server <- NULL
 
-  sys.www.root <- system.file('www', package='shiny')
-
   # This value, if non-NULL, must be present on all HTTP and WebSocket
   # requests as the Shiny-Shared-Secret header or else access will be
   # denied (403 response for HTTP, and instant close for websocket).
-  sharedSecret <- getOption('shiny.sharedSecret')
+  checkSharedSecret <- loadSharedSecret()
 
   appHandlers <- list(
     http = joinHandlers(c(
       sessionHandler,
       httpHandlers,
-      sys.www.root,
-      resourcePathHandler,
-      reactLogHandler)),
+      reactLogHandler
+    )),
     ws = function(ws) {
-      if (!is.null(sharedSecret)
-          && !identical(sharedSecret, ws$request$HTTP_SHINY_SHARED_SECRET)) {
+      if (!checkSharedSecret(ws$request$HTTP_SHINY_SHARED_SECRET)) {
         ws$close()
         return(TRUE)
       }
@@ -226,7 +201,7 @@ createAppHandlers <- function(httpHandlers, serverFuncSource) {
               message("RECV ", rawToChar(msg))
           }
 
-          if (identical(charToRaw("\003\xe9"), msg))
+          if (isEmptyMessage(msg))
             return()
 
           msg <- decodeMessage(msg)
@@ -243,94 +218,87 @@ createAppHandlers <- function(httpHandlers, serverFuncSource) {
             } else {
               # If there's bookmarked state, save it on the session object
               shinysession$restoreContext <- RestoreContext$new(msg$data$.clientdata_url_search)
+              shinysession$createBookmarkObservers()
             }
           }
 
-          withRestoreContext(shinysession$restoreContext, {
 
-            msg$data <- applyInputHandlers(msg$data)
+          msg$data <- applyInputHandlers(msg$data)
 
-            switch(
-              msg$method,
-              init = {
+          switch(
+            msg$method,
+            init = {
 
-                serverFunc <- withReactiveDomain(NULL, serverFuncSource())
-                if (!identicalFunctionBodies(serverFunc, appvars$server)) {
-                  appvars$server <- serverFunc
-                  if (!is.null(appvars$server))
-                  {
-                    # Tag this function as the Shiny server function. A debugger may use this
-                    # tag to give this function special treatment.
-                    # It's very important that it's appvars$server itself and NOT a copy that
-                    # is invoked, otherwise new breakpoints won't be picked up.
-                    attr(appvars$server, "shinyServerFunction") <- TRUE
-                    registerDebugHook("server", appvars, "Server Function")
-                  }
+              serverFunc <- withReactiveDomain(NULL, serverFuncSource())
+              if (!identicalFunctionBodies(serverFunc, appvars$server)) {
+                appvars$server <- serverFunc
+                if (!is.null(appvars$server))
+                {
+                  # Tag this function as the Shiny server function. A debugger may use this
+                  # tag to give this function special treatment.
+                  # It's very important that it's appvars$server itself and NOT a copy that
+                  # is invoked, otherwise new breakpoints won't be picked up.
+                  attr(appvars$server, "shinyServerFunction") <- TRUE
+                  registerDebugHook("server", appvars, "Server Function")
                 }
+              }
 
-                # Check for switching into/out of showcase mode
-                if (.globals$showcaseOverride &&
-                    exists(".clientdata_url_search", where = msg$data)) {
-                  mode <- showcaseModeOfQuerystring(msg$data$.clientdata_url_search)
-                  if (!is.null(mode))
-                    shinysession$setShowcase(mode)
-                }
+              # Check for switching into/out of showcase mode
+              if (.globals$showcaseOverride &&
+                  exists(".clientdata_url_search", where = msg$data)) {
+                mode <- showcaseModeOfQuerystring(msg$data$.clientdata_url_search)
+                if (!is.null(mode))
+                  shinysession$setShowcase(mode)
+              }
 
-                shinysession$manageInputs(msg$data)
+              # In shinysession$createBookmarkObservers() above, observers may be
+              # created, which puts the shiny session in busyCount > 0 state. That
+              # prevents the manageInputs here from taking immediate effect, by
+              # default. The manageInputs here needs to take effect though, because
+              # otherwise the bookmark observers won't find the clientData they are
+              # looking for. So use `now = TRUE` to force the changes to be
+              # immediate.
+              #
+              # FIXME: break createBookmarkObservers into two separate steps, one
+              # before and one after manageInputs, and put the observer creation
+              # in the latter. Then add an assertion that busyCount == 0L when
+              # this manageInputs is called.
+              shinysession$manageInputs(msg$data, now = TRUE)
 
-                # The client tells us what singletons were rendered into
-                # the initial page
-                if (!is.null(msg$data$.clientdata_singletons)) {
-                  shinysession$singletons <- strsplit(
-                    msg$data$.clientdata_singletons, ',')[[1]]
-                }
+              # The client tells us what singletons were rendered into
+              # the initial page
+              if (!is.null(msg$data$.clientdata_singletons)) {
+                shinysession$singletons <- strsplit(
+                  msg$data$.clientdata_singletons, ',')[[1]]
+              }
 
-                local({
-                  args <- argsForServerFunc(serverFunc, shinysession)
+              local({
+                args <- argsForServerFunc(serverFunc, shinysession)
 
-                  withReactiveDomain(shinysession, {
-                    do.call(
-                      # No corresponding ..stacktraceoff; the server func is pure
-                      # user code
-                      wrapFunctionLabel(appvars$server, "server",
-                        ..stacktraceon = TRUE
-                      ),
-                      args
-                    )
-                  })
+                withReactiveDomain(shinysession, {
+                  do.call(
+                    # No corresponding ..stacktraceoff; the server func is pure
+                    # user code
+                    wrapFunctionLabel(appvars$server, "server",
+                      ..stacktraceon = TRUE
+                    ),
+                    args
+                  )
                 })
-              },
-              update = {
-                shinysession$manageInputs(msg$data)
-              },
-              shinysession$dispatch(msg)
-            )
-            shinysession$manageHiddenOutputs()
+              })
+            },
+            update = {
+              shinysession$manageInputs(msg$data)
+            },
+            shinysession$dispatch(msg)
+          )
+          # The HTTP_GUID, if it exists, is for Shiny Server reporting purposes
+          shinysession$startTiming(ws$request$HTTP_GUID)
+          shinysession$requestFlush()
 
-            if (exists(".shiny__stdout", globalenv()) &&
-                exists("HTTP_GUID", ws$request)) {
-              # safe to assume we're in shiny-server
-              shiny_stdout <- get(".shiny__stdout", globalenv())
-
-              # eNter a flushReact
-              writeLines(paste("_n_flushReact ", get("HTTP_GUID", ws$request),
-                " @ ", sprintf("%.3f", as.numeric(Sys.time())),
-                sep=""), con=shiny_stdout)
-              flush(shiny_stdout)
-
-              flushReact()
-
-              # eXit a flushReact
-              writeLines(paste("_x_flushReact ", get("HTTP_GUID", ws$request),
-                " @ ", sprintf("%.3f", as.numeric(Sys.time())),
-                sep=""), con=shiny_stdout)
-              flush(shiny_stdout)
-            } else {
-              flushReact()
-            }
-
-            flushAllSessions()
-          })
+          # Make httpuv return control to Shiny quickly, instead of waiting
+          # for the usual timeout
+          httpuv::interrupt()
         })
       }
       ws$onMessage(function(binary, msg) {
@@ -341,6 +309,7 @@ createAppHandlers <- function(httpHandlers, serverFuncSource) {
       ws$onClose(function() {
         shinysession$wsClosed()
         appsByToken$remove(shinysession$token)
+        appsNeedingFlush$remove(shinysession$token)
       })
 
       return(TRUE)
@@ -370,9 +339,9 @@ argsForServerFunc <- function(serverFunc, session) {
 }
 
 getEffectiveBody <- function(func) {
-  # Note: NULL values are OK. isS4(NULL) returns FALSE, body(NULL)
-  # returns NULL.
-  if (isS4(func) && class(func) == "functionWithTrace")
+  if (is.null(func))
+    NULL
+  else if (isS4(func) && class(func) == "functionWithTrace")
     body(func@original)
   else
     body(func)
@@ -420,11 +389,35 @@ startApp <- function(appObj, port, host, quiet) {
   handlerManager$addHandler(appHandlers$http, "/", tail = TRUE)
   handlerManager$addWSHandler(appHandlers$ws, "/", tail = TRUE)
 
+  httpuvApp <- handlerManager$createHttpuvApp()
+  httpuvApp$staticPaths <- c(
+    appObj$staticPaths,
+    list(
+      # Always handle /session URLs dynamically, even if / is a static path.
+      "session" = excludeStaticPath(),
+      "shared" = system.file(package = "shiny", "www", "shared")
+    ),
+    .globals$resourcePaths
+  )
+  httpuvApp$staticPathOptions <- httpuv::staticPathOptions(
+    html_charset = "utf-8",
+    headers = list("X-UA-Compatible" = "IE=edge,chrome=1"),
+    validation =
+      if (!is.null(getOption("shiny.sharedSecret"))) {
+        sprintf('"Shiny-Shared-Secret" == "%s"', getOption("shiny.sharedSecret"))
+      } else {
+        character(0)
+      }
+  )
+
   if (is.numeric(port) || is.integer(port)) {
     if (!quiet) {
-      message('\n', 'Listening on http://', host, ':', port)
+      hostString <- host
+      if (httpuv::ipFamily(host) == 6L)
+        hostString <- paste0("[", hostString, "]")
+      message('\n', 'Listening on http://', hostString, ':', port)
     }
-    return(startServer(host, port, handlerManager$createHttpuvApp()))
+    return(startServer(host, port, httpuvApp))
   } else if (is.character(port)) {
     if (!quiet) {
       message('\n', 'Listening on domain socket ', port)
@@ -436,31 +429,44 @@ startApp <- function(appObj, port, host, quiet) {
            "configuration (and not domain sockets), then `port` must ",
            "be numeric, not a string.")
     }
-    return(startPipeServer(port, mask, handlerManager$createHttpuvApp()))
+    return(startPipeServer(port, mask, httpuvApp))
   }
 }
 
 # Run an application that was created by \code{\link{startApp}}. This
 # function should normally be called in a \code{while(TRUE)} loop.
 serviceApp <- function() {
-  if (timerCallbacks$executeElapsed()) {
-    for (shinysession in appsByToken$values()) {
-      shinysession$manageHiddenOutputs()
-    }
+  timerCallbacks$executeElapsed()
 
-    flushReact()
-    flushAllSessions()
-  }
+  flushReact()
+  flushPendingSessions()
 
   # If this R session is interactive, then call service() with a short timeout
   # to keep the session responsive to user input
   maxTimeout <- ifelse(interactive(), 100, 1000)
 
-  timeout <- max(1, min(maxTimeout, timerCallbacks$timeToNextEvent()))
+  timeout <- max(1, min(maxTimeout, timerCallbacks$timeToNextEvent(), later::next_op_secs()))
   service(timeout)
+
+  flushReact()
+  flushPendingSessions()
 }
 
 .shinyServerMinVersion <- '0.3.4'
+
+# Global flag that's TRUE whenever we're inside of the scope of a call to runApp
+.globals$running <- FALSE
+
+#' Check whether a Shiny application is running
+#'
+#' This function tests whether a Shiny application is currently running.
+#'
+#' @return \code{TRUE} if a Shiny application is currently running. Otherwise,
+#'   \code{FALSE}.
+#' @export
+isRunning <- function() {
+  .globals$running
+}
 
 #' Run Shiny Application
 #'
@@ -518,6 +524,8 @@ serviceApp <- function() {
 #'
 #' ## Only run this example in interactive R sessions
 #' if (interactive()) {
+#'   options(device.ask.default = FALSE)
+#'
 #'   # Apps can be run without a server.r and ui.r file
 #'   runApp(list(
 #'     ui = bootstrapPage(
@@ -555,16 +563,38 @@ runApp <- function(appDir=getwd(),
     handlerManager$clear()
   }, add = TRUE)
 
-  # Enable per-app Shiny options
+  if (.globals$running) {
+    stop("Can't call `runApp()` from within `runApp()`. If your ",
+         "application code contains `runApp()`, please remove it.")
+  }
+  .globals$running <- TRUE
+  on.exit({
+    .globals$running <- FALSE
+  }, add = TRUE)
+
+  # Enable per-app Shiny options, for shinyOptions() and getShinyOption().
   oldOptionSet <- .globals$options
   on.exit({
     .globals$options <- oldOptionSet
   },add = TRUE)
 
+  # A unique identifier associated with this run of this application. It is
+  # shared across sessions.
+  shinyOptions(appToken = createUniqueId(8))
+
   # Make warnings print immediately
   # Set pool.scheduler to support pool package
-  ops <- options(warn = 1, pool.scheduler = scheduleTask)
+  ops <- options(
+    # Raise warn level to 1, but don't lower it
+    warn = max(1, getOption("warn", default = 1)),
+    pool.scheduler = scheduleTask
+  )
   on.exit(options(ops), add = TRUE)
+
+  # Set up default cache for app.
+  if (is.null(getShinyOption("cache"))) {
+    shinyOptions(cache = MemoryCache$new())
+  }
 
   appParts <- as.shiny.appobj(appDir)
 
@@ -702,7 +732,8 @@ runApp <- function(appDir=getwd(),
           port <- p_randomInt(3000, 8000)
           # Reject ports in this range that are considered unsafe by Chrome
           # http://superuser.com/questions/188058/which-ports-are-considered-unsafe-on-chrome
-          if (!port %in% c(3659, 4045, 6000, 6665:6669)) {
+          # https://github.com/rstudio/shiny/issues/1784
+          if (!port %in% c(3659, 4045, 6000, 6665:6669, 6697)) {
             break
           }
         }
@@ -718,27 +749,47 @@ runApp <- function(appDir=getwd(),
     }
   }
 
+  # Invoke user-defined onStop callbacks, before the application's internal
+  # onStop callbacks.
+  on.exit({
+    .globals$onStopCallbacks$invoke()
+    .globals$onStopCallbacks <- Callbacks$new()
+  }, add = TRUE)
+
   # Extract appOptions (which is a list) and store them as shinyOptions, for
   # this app. (This is the only place we have to store settings that are
   # accessible both the UI and server portion of the app.)
   unconsumeAppOptions(appParts$appOptions)
 
-  # Set up the onEnd before we call onStart, so that it gets called even if an
+  # Set up the onStop before we call onStart, so that it gets called even if an
   # error happens in onStart.
-  if (!is.null(appParts$onEnd))
-    on.exit(appParts$onEnd(), add = TRUE)
+  if (!is.null(appParts$onStop))
+    on.exit(appParts$onStop(), add = TRUE)
   if (!is.null(appParts$onStart))
     appParts$onStart()
 
   server <- startApp(appParts, port, host, quiet)
+
+  # Make the httpuv server object accessible. Needed for calling
+  # addResourcePath while app is running.
+  shinyOptions(server = server)
 
   on.exit({
     stopServer(server)
   }, add = TRUE)
 
   if (!is.character(port)) {
-    # http://0.0.0.0/ doesn't work on QtWebKit (i.e. RStudio viewer)
-    browseHost <- if (identical(host, "0.0.0.0")) "127.0.0.1" else host
+    browseHost <- host
+    if (identical(host, "0.0.0.0")) {
+      # http://0.0.0.0/ doesn't work on QtWebKit (i.e. RStudio viewer)
+      browseHost <- "127.0.0.1"
+    } else if (identical(host, "::")) {
+      browseHost <- "::1"
+    }
+
+    if (httpuv::ipFamily(browseHost) == 6L) {
+      browseHost <- paste0("[", browseHost, "]")
+    }
 
     appUrl <- paste("http://", browseHost, ":", port, sep="")
     if (is.function(launch.browser))
@@ -761,12 +812,12 @@ runApp <- function(appDir=getwd(),
   # Top-level ..stacktraceoff..; matches with ..stacktraceon in observe(),
   # reactive(), Callbacks$invoke(), and others
   ..stacktraceoff..(
-    captureStackTraces(
+    captureStackTraces({
       while (!.globals$stopped) {
-        serviceApp()
+        ..stacktracefloor..(serviceApp())
         Sys.sleep(0.001)
       }
-    )
+    })
   )
 
   if (isTRUE(.globals$reterror)) {
@@ -1003,4 +1054,10 @@ browserViewer <- function(browser = getOption("browser")) {
 # otherwise returns FALSE.
 inShinyServer <- function() {
   nzchar(Sys.getenv('SHINY_PORT'))
+}
+
+# This check was moved out of the main function body because of an issue with
+# the RStudio debugger. (#1474)
+isEmptyMessage <- function(msg) {
+  identical(charToRaw("\003\xe9"), msg)
 }

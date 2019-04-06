@@ -5,11 +5,11 @@
 \alias{uiOutput}
 \title{Create an HTML output element}
 \usage{
-htmlOutput(outputId, inline = FALSE, container = if (inline) span else div,
-  ...)
+htmlOutput(outputId, inline = FALSE, container = if (inline) span else
+  div, ...)
 
-uiOutput(outputId, inline = FALSE, container = if (inline) span else div,
-  ...)
+uiOutput(outputId, inline = FALSE, container = if (inline) span else
+  div, ...)
 }
 \arguments{
 \item{outputId}{output variable to read the value from}
@@ -42,4 +42,3 @@ tags$ul(
   htmlOutput("summary", container = tags$li, class = "custom-li-output")
 )
 }
-

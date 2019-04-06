@@ -1,4 +1,4 @@
-globalVariables('func')
+utils::globalVariables('func')
 
 #' Mark a function as a render function
 #'
@@ -52,6 +52,49 @@ markRenderFunction <- function(uiFunc, renderFunc, outputArgs = list()) {
             hasExecuted = hasExecuted)
 }
 
+#' Implement render functions
+#'
+#' @param func A function without parameters, that returns user data. If the
+#'   returned value is a promise, then the render function will proceed in async
+#'   mode.
+#' @param transform A function that takes four arguments: \code{value},
+#'   \code{session}, \code{name}, and \code{...} (for future-proofing). This
+#'   function will be invoked each time a value is returned from \code{func},
+#'   and is responsible for changing the value into a JSON-ready value to be
+#'   JSON-encoded and sent to the browser.
+#' @param outputFunc The UI function that is used (or most commonly used) with
+#'   this render function. This can be used in R Markdown documents to create
+#'   complete output widgets out of just the render function.
+#' @param outputArgs A list of arguments to pass to the \code{outputFunc}.
+#'   Render functions should include \code{outputArgs = list()} in their own
+#'   parameter list, and pass through the value as this argument, to allow app
+#'   authors to customize outputs. (Currently, this is only supported for
+#'   dynamically generated UIs, such as those created by Shiny code snippets
+#'   embedded in R Markdown documents).
+#' @return An annotated render function, ready to be assigned to an
+#'   \code{output} slot.
+#'
+#' @export
+createRenderFunction <- function(
+  func, transform = function(value, session, name, ...) value,
+  outputFunc = NULL, outputArgs = NULL
+) {
+
+  renderFunc <- function(shinysession, name, ...) {
+    hybrid_chain(
+      func(),
+      function(value, .visible) {
+        transform(setVisible(value, .visible), shinysession, name, ...)
+      }
+    )
+  }
+
+  if (!is.null(outputFunc))
+    markRenderFunction(outputFunc, renderFunc, outputArgs = outputArgs)
+  else
+    renderFunc
+}
+
 useRenderFunction <- function(renderFunc, inline = FALSE) {
   outputFunction <- attr(renderFunc, "outputFunc")
   outputArgs <- attr(renderFunc, "outputArgs")
@@ -68,12 +111,16 @@ useRenderFunction <- function(renderFunc, inline = FALSE) {
   }
 
   id <- createUniqueId(8, "out")
-  # Make the id the first positional argument
-  outputArgs <- c(list(id), outputArgs)
 
   o <- getDefaultReactiveDomain()$output
-  if (!is.null(o))
+  if (!is.null(o)) {
     o[[id]] <- renderFunc
+    # If there's a namespace, we must respect it
+    id <- getDefaultReactiveDomain()$ns(id)
+  }
+
+  # Make the id the first positional argument
+  outputArgs <- c(list(id), outputArgs)
 
   if (is.logical(formals(outputFunction)[["inline"]]) && !("inline" %in% names(outputArgs))) {
     outputArgs[["inline"]] <- inline
@@ -86,6 +133,34 @@ useRenderFunction <- function(renderFunc, inline = FALSE) {
 #' @method as.tags shiny.render.function
 as.tags.shiny.render.function <- function(x, ..., inline = FALSE) {
   useRenderFunction(x, inline = inline)
+}
+
+
+#' Mark a render function with attributes that will be used by the output
+#'
+#' @inheritParams markRenderFunction
+#' @param snapshotExclude If TRUE, exclude the output from test snapshots.
+#' @param snapshotPreprocess A function for preprocessing the value before
+#'   taking a test snapshot.
+#'
+#' @keywords internal
+markOutputAttrs <- function(renderFunc, snapshotExclude = NULL,
+  snapshotPreprocess = NULL)
+{
+  # Add the outputAttrs attribute if necessary
+  if (is.null(attr(renderFunc, "outputAttrs", TRUE))) {
+    attr(renderFunc, "outputAttrs") <- list()
+  }
+
+  if (!is.null(snapshotExclude)) {
+    attr(renderFunc, "outputAttrs")$snapshotExclude <- snapshotExclude
+  }
+
+  if (!is.null(snapshotPreprocess)) {
+    attr(renderFunc, "outputAttrs")$snapshotPreprocess <- snapshotPreprocess
+  }
+
+  renderFunc
 }
 
 #' Image file output
@@ -127,6 +202,7 @@ as.tags.shiny.render.function <- function(x, ..., inline = FALSE) {
 #' @examples
 #' ## Only run examples in interactive R sessions
 #' if (interactive()) {
+#' options(device.ask.default = FALSE)
 #'
 #' ui <- fluidPage(
 #'   sliderInput("n", "Number of observations", 2, 1000, 500),
@@ -193,26 +269,25 @@ renderImage <- function(expr, env=parent.frame(), quoted=FALSE,
                         deleteFile=TRUE, outputArgs=list()) {
   installExprFunction(expr, "func", env, quoted)
 
-  renderFunc <- function(shinysession, name, ...) {
-    imageinfo <- func()
-    # Should the file be deleted after being sent? If .deleteFile not set or if
-    # TRUE, then delete; otherwise don't delete.
-    if (deleteFile) {
-      on.exit(unlink(imageinfo$src))
-    }
+  createRenderFunction(func,
+    transform = function(imageinfo, session, name, ...) {
+      # Should the file be deleted after being sent? If .deleteFile not set or if
+      # TRUE, then delete; otherwise don't delete.
+      if (deleteFile) {
+        on.exit(unlink(imageinfo$src))
+      }
 
-    # If contentType not specified, autodetect based on extension
-    contentType <- imageinfo$contentType %OR% getContentType(imageinfo$src)
+      # If contentType not specified, autodetect based on extension
+      contentType <- imageinfo$contentType %OR% getContentType(imageinfo$src)
 
-    # Extra values are everything in imageinfo except 'src' and 'contentType'
-    extra_attr <- imageinfo[!names(imageinfo) %in% c('src', 'contentType')]
+      # Extra values are everything in imageinfo except 'src' and 'contentType'
+      extra_attr <- imageinfo[!names(imageinfo) %in% c('src', 'contentType')]
 
-    # Return a list with src, and other img attributes
-    c(src = shinysession$fileUrl(name, file=imageinfo$src, contentType=contentType),
-      extra_attr)
-  }
-
-  markRenderFunction(imageOutput, renderFunc, outputArgs = outputArgs)
+      # Return a list with src, and other img attributes
+      c(src = session$fileUrl(name, file=imageinfo$src, contentType=contentType),
+        extra_attr)
+    },
+    imageOutput, outputArgs)
 }
 
 
@@ -220,7 +295,7 @@ renderImage <- function(expr, env=parent.frame(), quoted=FALSE,
 #'
 #' Makes a reactive version of the given function that captures any printed
 #' output, and also captures its printable result (unless
-#' \code{\link{invisible}}), into a string. The resulting function is suitable
+#' \code{\link[base]{invisible}}), into a string. The resulting function is suitable
 #' for assigning to an  \code{output} slot.
 #'
 #' The corresponding HTML output tag can be anything (though \code{pre} is
@@ -232,14 +307,14 @@ renderImage <- function(expr, env=parent.frame(), quoted=FALSE,
 #'
 #' Note that unlike most other Shiny output functions, if the given function
 #' returns \code{NULL} then \code{NULL} will actually be visible in the output.
-#' To display nothing, make your function return \code{\link{invisible}()}.
+#' To display nothing, make your function return \code{\link[base]{invisible}()}.
 #'
 #' @param expr An expression that may print output and/or return a printable R
 #'   object.
 #' @param env The environment in which to evaluate \code{expr}.
 #' @param quoted Is \code{expr} a quoted expression (with \code{quote()})? This
 #'   is useful if you want to save an expression in a variable.
-#' @param width The value for \code{\link{options}('width')}.
+#' @param width The value for \code{\link[base]{options}('width')}.
 #' @param outputArgs A list of arguments to be passed through to the implicit
 #'   call to \code{\link{verbatimTextOutput}} when \code{renderPrint} is used
 #'   in an interactive R Markdown document.
@@ -252,13 +327,72 @@ renderPrint <- function(expr, env = parent.frame(), quoted = FALSE,
                         width = getOption('width'), outputArgs=list()) {
   installExprFunction(expr, "func", env, quoted)
 
+  # Set a promise domain that sets the console width
+  #   and captures output
+  # op <- options(width = width)
+  # on.exit(options(op), add = TRUE)
+
   renderFunc <- function(shinysession, name, ...) {
-    op <- options(width = width)
-    on.exit(options(op), add = TRUE)
-    paste(utils::capture.output(func()), collapse = "\n")
+    domain <- createRenderPrintPromiseDomain(width)
+    hybrid_chain(
+      {
+        promises::with_promise_domain(domain, func())
+      },
+      function(value, .visible) {
+        if (.visible) {
+          cat(file = domain$conn, paste(utils::capture.output(value, append = TRUE), collapse = "\n"))
+        }
+        res <- paste(readLines(domain$conn, warn = FALSE), collapse = "\n")
+        res
+      },
+      finally = function() {
+        close(domain$conn)
+      }
+    )
   }
 
   markRenderFunction(verbatimTextOutput, renderFunc, outputArgs = outputArgs)
+}
+
+createRenderPrintPromiseDomain <- function(width) {
+  f <- file()
+
+  promises::new_promise_domain(
+    wrapOnFulfilled = function(onFulfilled) {
+      force(onFulfilled)
+      function(...) {
+        op <- options(width = width)
+        on.exit(options(op), add = TRUE)
+
+        sink(f, append = TRUE)
+        on.exit(sink(NULL), add = TRUE)
+
+        onFulfilled(...)
+      }
+    },
+    wrapOnRejected = function(onRejected) {
+      force(onRejected)
+      function(...) {
+        op <- options(width = width)
+        on.exit(options(op), add = TRUE)
+
+        sink(f, append = TRUE)
+        on.exit(sink(NULL), add = TRUE)
+
+        onRejected(...)
+      }
+    },
+    wrapSync = function(expr) {
+      op <- options(width = width)
+      on.exit(options(op), add = TRUE)
+
+      sink(f, append = TRUE)
+      on.exit(sink(NULL), add = TRUE)
+
+      force(expr)
+    },
+    conn = f
+  )
 }
 
 #' Text Output
@@ -292,18 +426,18 @@ renderText <- function(expr, env=parent.frame(), quoted=FALSE,
                        outputArgs=list()) {
   installExprFunction(expr, "func", env, quoted)
 
-  renderFunc <- function(shinysession, name, ...) {
-    value <- func()
-    return(paste(utils::capture.output(cat(value)), collapse="\n"))
-  }
-
-  markRenderFunction(textOutput, renderFunc, outputArgs = outputArgs)
+  createRenderFunction(
+    func,
+    function(value, session, name, ...) {
+      paste(utils::capture.output(cat(value)), collapse="\n")
+    },
+    textOutput, outputArgs
+  )
 }
 
 #' UI Output
 #'
-#' \bold{Experimental feature.} Makes a reactive version of a function that
-#' generates HTML using the Shiny UI library.
+#' Renders reactive HTML using the Shiny UI library.
 #'
 #' The corresponding HTML output tag should be \code{div} and have the CSS class
 #' name \code{shiny-html-output} (or use \code{\link{uiOutput}}).
@@ -317,7 +451,7 @@ renderText <- function(expr, env=parent.frame(), quoted=FALSE,
 #'   call to \code{\link{uiOutput}} when \code{renderUI} is used in an
 #'   interactive R Markdown document.
 #'
-#' @seealso conditionalPanel
+#' @seealso \code{\link{uiOutput}}
 #' @export
 #' @examples
 #' ## Only run examples in interactive R sessions
@@ -342,15 +476,16 @@ renderUI <- function(expr, env=parent.frame(), quoted=FALSE,
                      outputArgs=list()) {
   installExprFunction(expr, "func", env, quoted)
 
-  renderFunc <- function(shinysession, name, ...) {
-    result <- func()
-    if (is.null(result) || length(result) == 0)
-      return(NULL)
+  createRenderFunction(
+    func,
+    function(result, shinysession, name, ...) {
+      if (is.null(result) || length(result) == 0)
+        return(NULL)
 
-    processDeps(result, shinysession)
-  }
-
-  markRenderFunction(uiOutput, renderFunc, outputArgs = outputArgs)
+      processDeps(result, shinysession)
+    },
+    uiOutput, outputArgs
+  )
 }
 
 #' File Downloads
@@ -409,7 +544,9 @@ downloadHandler <- function(filename, content, contentType=NA, outputArgs=list()
   renderFunc <- function(shinysession, name, ...) {
     shinysession$registerDownload(name, filename, contentType, content)
   }
-  markRenderFunction(downloadButton, renderFunc, outputArgs = outputArgs)
+  snapshotExclude(
+    markRenderFunction(downloadButton, renderFunc, outputArgs = outputArgs)
+  )
 }
 
 #' Table output with the JavaScript library DataTables
@@ -420,7 +557,7 @@ downloadHandler <- function(filename, content, contentType=NA, outputArgs=list()
 #' the server infrastructure.
 #'
 #' For the \code{options} argument, the character elements that have the class
-#' \code{"AsIs"} (usually returned from \code{\link{I}()}) will be evaluated in
+#' \code{"AsIs"} (usually returned from \code{\link[base]{I}()}) will be evaluated in
 #' JavaScript. This is useful when the type of the option value is not supported
 #' in JSON, e.g., a JavaScript function, which can be obtained by evaluating a
 #' character string. Note this only applies to the root-level elements of the
@@ -486,31 +623,46 @@ renderDataTable <- function(expr, options = NULL, searchDelay = 500,
     if (is.function(options)) options <- options()
     options <- checkDT9(options)
     res <- checkAsIs(options)
-    data <- func()
-    if (length(dim(data)) != 2) return() # expects a rectangular data object
-    if (is.data.frame(data)) data <- as.data.frame(data)
-    action <- shinysession$registerDataObj(name, data, dataTablesJSON)
-    colnames <- colnames(data)
-    # if escape is column names, turn names to numeric indices
-    if (is.character(escape)) {
-      escape <- stats::setNames(seq_len(ncol(data)), colnames)[escape]
-      if (any(is.na(escape)))
-        stop("Some column names in the 'escape' argument not found in data")
-    }
-    colnames[escape] <- htmlEscape(colnames[escape])
-    if (!is.logical(escape)) {
-      if (!is.numeric(escape))
-        stop("'escape' must be TRUE, FALSE, or a numeric vector, or column names")
-      escape <- paste(escape, collapse = ',')
-    }
-    list(
-      colnames = colnames, action = action, options = res$options,
-      evalOptions = if (length(res$eval)) I(res$eval), searchDelay = searchDelay,
-      callback = paste(callback, collapse = '\n'), escape = escape
+    hybrid_chain(
+      func(),
+      function(data) {
+        if (length(dim(data)) != 2) return() # expects a rectangular data object
+        if (is.data.frame(data)) data <- as.data.frame(data)
+        action <- shinysession$registerDataObj(name, data, dataTablesJSON)
+        colnames <- colnames(data)
+        # if escape is column names, turn names to numeric indices
+        if (is.character(escape)) {
+          escape <- stats::setNames(seq_len(ncol(data)), colnames)[escape]
+          if (any(is.na(escape)))
+            stop("Some column names in the 'escape' argument not found in data")
+        }
+        colnames[escape] <- htmlEscape(colnames[escape])
+        if (!is.logical(escape)) {
+          if (!is.numeric(escape))
+            stop("'escape' must be TRUE, FALSE, or a numeric vector, or column names")
+          escape <- paste(escape, collapse = ',')
+        }
+        list(
+          colnames = colnames, action = action, options = res$options,
+          evalOptions = if (length(res$eval)) I(res$eval), searchDelay = searchDelay,
+          callback = paste(callback, collapse = '\n'), escape = escape
+        )
+      }
     )
   }
 
-  markRenderFunction(dataTableOutput, renderFunc, outputArgs = outputArgs)
+  renderFunc <- markRenderFunction(dataTableOutput, renderFunc, outputArgs = outputArgs)
+
+  renderFunc <- snapshotPreprocessOutput(renderFunc, function(value) {
+    # Remove the action field so that it's not saved in test snapshots. It
+    # contains a value that changes every time an app is run, and shouldn't be
+    # stored for test snapshots. It will be something like:
+    # "session/e0d14d3fe97f672f9655a127f2a1e079/dataobj/table?w=&nonce=7f5d6d54e22450a3"
+    value$action <- NULL
+    value
+  })
+
+  renderFunc
 }
 
 # a data frame containing the DataTables 1.9 and 1.10 names

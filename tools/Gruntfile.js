@@ -74,6 +74,20 @@ module.exports = function(grunt) {
       },
     },
 
+    "string-replace": {
+      version: {
+        files: {
+          './temp_concat/shiny.js': './temp_concat/shiny.js'
+        },
+        options: {
+          replacements: [{
+            pattern: /{{\s*VERSION\s*}}/g,
+            replacement: pkgInfo().version
+          }]
+        }
+      }
+    },
+
     babel: {
       options: {
         sourceMap: true,
@@ -98,6 +112,7 @@ module.exports = function(grunt) {
           // "no-shadow": 1,
           "no-undef": 1,
           "no-unused-vars": [1, {"args": "none"}],
+          "guard-for-in": 1,
           // "no-use-before-define": [1, {"functions": false}],
           "semi": [1, "always"]
         },
@@ -138,27 +153,12 @@ module.exports = function(grunt) {
       }
     },
 
-    copy: {
-      babelPolyfill: {
-        src: "node_modules/babel-polyfill/dist/polyfill.min.js",
-        dest: "../inst/www/shared/babel-polyfill.min.js"
-      }
-    },
-
     watch: {
       shiny: {
         files: ['<%= concat.shiny.src %>', '../DESCRIPTION'],
         tasks: [
-          'newer:concat',
-          'newer:eslint',
-          'configureBabel',
-          'newer:babel',
-          'newer:uglify'
+          'default'
         ]
-      },
-      babelPolyfill: {
-        files: '<%= copy.babelPolyfill.src %>',
-        tasks: ['newer:copy:babelPolyfill']
       },
       datepicker: {
         files: '<%= uglify.datepicker.src %>',
@@ -184,11 +184,11 @@ module.exports = function(grunt) {
 
   grunt.loadNpmTasks('grunt-contrib-clean');
   grunt.loadNpmTasks('grunt-contrib-concat');
+  grunt.loadNpmTasks('grunt-string-replace');
   grunt.loadNpmTasks('grunt-babel');
   grunt.loadNpmTasks('grunt-eslint');
   grunt.loadNpmTasks('grunt-contrib-uglify');
   grunt.loadNpmTasks('grunt-contrib-watch');
-  grunt.loadNpmTasks('grunt-contrib-copy');
   grunt.loadNpmTasks('grunt-newer');
 
   // Need this here so that babel reads in the source map file after it's
@@ -198,15 +198,27 @@ module.exports = function(grunt) {
     gruntConfig.babel.options.inputSourceMap = grunt.file.readJSON('./temp_concat/shiny.js.map');
   });
 
+  grunt.task.registerTask(
+    "validateStringReplace",
+    "tests to make sure the version value was replaced",
+    function() {
+      var shinyContent = require('fs').readFileSync('./temp_concat/shiny.js', 'utf8');
+      if (/{{\s*VERSION\s*}}/.test(shinyContent)) {
+        grunt.fail.fatal("{{ VERSION }} was not replaced in compiled shiny.js file!")
+      }
+    }
+  );
+
   grunt.initConfig(gruntConfig);
 
   grunt.registerTask('default', [
     'newer:concat',
+    'newer:string-replace',
+    'validateStringReplace',
     'newer:eslint',
     'configureBabel',
     'newer:babel',
-    'newer:uglify',
-    'newer:copy'
+    'newer:uglify'
   ]);
 
 

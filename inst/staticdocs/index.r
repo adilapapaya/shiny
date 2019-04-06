@@ -41,6 +41,7 @@ sd_section("UI Inputs",
     "numericInput",
     "radioButtons",
     "selectInput",
+    "varSelectInput",
     "sliderInput",
     "submitButton",
     "textInput",
@@ -57,9 +58,12 @@ sd_section("UI Inputs",
     "updateSelectInput",
     "updateSliderInput",
     "updateTabsetPanel",
+    "insertTab",
+    "showTab",
     "updateTextInput",
     "updateTextAreaInput",
-    "updateQueryString"
+    "updateQueryString",
+    "getQueryString"
   )
 )
 sd_section("UI Outputs",
@@ -101,6 +105,7 @@ sd_section("Rendering functions",
   "Functions that you use in your application's server side code, assigning them to outputs that appear in your user interface.",
   c(
     "renderPlot",
+    "renderCachedPlot",
     "renderText",
     "renderPrint",
     "renderDataTable",
@@ -112,27 +117,30 @@ sd_section("Rendering functions",
     "reactivePrint",
     "reactiveTable",
     "reactiveText",
-    "reactiveUI"
+    "reactiveUI",
+    "createRenderFunction"
   )
 )
-sd_section("Reactive constructs",
+sd_section("Reactive programming",
   "A sub-library that provides reactive programming facilities for R.",
   c(
-    "invalidateLater",
-    "is.reactivevalues",
-    "isolate",
-    "makeReactiveBinding",
+    "reactive",
     "observe",
     "observeEvent",
-    "reactive",
+    "reactiveVal",
+    "reactiveValues",
+    "reactiveValuesToList",
+    "is.reactivevalues",
+    "isolate",
+    "invalidateLater",
+    "debounce",
+    "reactlog",
+    "makeReactiveBinding",
     "reactiveFileReader",
     "reactivePoll",
     "reactiveTimer",
-    "reactiveValues",
-    "reactiveValuesToList",
-    "freezeReactiveValue",
     "domains",
-    "showReactLog"
+    "freezeReactiveValue"
   )
 )
 sd_section("Boilerplate",
@@ -151,7 +159,8 @@ sd_section("Running",
     "runGadget",
     "runUrl",
     "stopApp",
-    "viewer"
+    "viewer",
+    "isRunning"
   )
 )
 sd_section("Bookmarking state",
@@ -188,12 +197,23 @@ sd_section("Utility functions",
     "exprToFunction",
     "installExprFunction",
     "parseQueryString",
+    "getCurrentOutputInfo",
     "plotPNG",
+    "sizeGrowthRatio",
     "exportTestValues",
+    "setSerializer",
+    "snapshotExclude",
+    "snapshotPreprocessInput",
+    "snapshotPreprocessOutput",
+    "markOutputAttrs",
     "repeatable",
     "shinyDeprecated",
     "serverInfo",
-    "shiny-options"
+    "shiny-options",
+    "onStop",
+    "diskCache",
+    "memoryCache",
+    "key_missing"
   )
 )
 sd_section("Plot interaction",

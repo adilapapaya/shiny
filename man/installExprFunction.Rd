@@ -4,9 +4,10 @@
 \alias{installExprFunction}
 \title{Install an expression as a function}
 \usage{
-installExprFunction(expr, name, eval.env = parent.frame(2), quoted = FALSE,
-  assign.env = parent.frame(1), label = deparse(sys.call(-1)[[1]]),
-  wrappedWithLabel = TRUE, ..stacktraceon = FALSE)
+installExprFunction(expr, name, eval.env = parent.frame(2),
+  quoted = FALSE, assign.env = parent.frame(1),
+  label = deparse(sys.call(-1)[[1]]), wrappedWithLabel = TRUE,
+  ..stacktraceon = FALSE)
 }
 \arguments{
 \item{expr}{A quoted or unquoted expression}
@@ -40,4 +41,3 @@ function named \code{func} in the current environment.
 Wraps \code{\link{exprToFunction}}; see that method's documentation
   for more documentation and examples.
 }
-

@@ -4,8 +4,8 @@
 \alias{hoverOpts}
 \title{Create an object representing hover options}
 \usage{
-hoverOpts(id = NULL, delay = 300, delayType = c("debounce", "throttle"),
-  clip = TRUE, nullOutside = TRUE)
+hoverOpts(id = NULL, delay = 300, delayType = c("debounce",
+  "throttle"), clip = TRUE, nullOutside = TRUE)
 }
 \arguments{
 \item{id}{Input value name. For example, if the value is \code{"plot_hover"},
@@ -33,4 +33,3 @@ This generates an object representing hovering options, to be passed as the
 \code{hover} argument of \code{\link{imageOutput}} or
 \code{\link{plotOutput}}.
 }
-

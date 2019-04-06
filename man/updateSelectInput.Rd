@@ -3,12 +3,20 @@
 \name{updateSelectInput}
 \alias{updateSelectInput}
 \alias{updateSelectizeInput}
+\alias{updateVarSelectInput}
+\alias{updateVarSelectizeInput}
 \title{Change the value of a select input on the client}
 \usage{
 updateSelectInput(session, inputId, label = NULL, choices = NULL,
   selected = NULL)
 
 updateSelectizeInput(session, inputId, label = NULL, choices = NULL,
+  selected = NULL, options = list(), server = FALSE)
+
+updateVarSelectInput(session, inputId, label = NULL, data = NULL,
+  selected = NULL)
+
+updateVarSelectizeInput(session, inputId, label = NULL, data = NULL,
   selected = NULL, options = list(), server = FALSE)
 }
 \arguments{
@@ -32,7 +40,7 @@ example section for a small demo of this feature.}
 for single-select lists and no values for multiple select lists.}
 
 \item{options}{A list of options. See the documentation of \pkg{selectize.js}
-for possible options (character option values inside \code{\link{I}()} will
+for possible options (character option values inside \code{\link[base]{I}()} will
 be treated as literal JavaScript code; see \code{\link{renderDataTable}()}
 for details).}
 
@@ -40,6 +48,8 @@ for details).}
 the select options dynamically on searching, instead of writing all
 \code{choices} into the page at once (i.e., only use the client-side
 version of \pkg{selectize.js})}
+
+\item{data}{A data frame. Used to retrieve the column names as choices for a \code{\link{selectInput}}}
 }
 \description{
 Change the value of a select input on the client
@@ -94,6 +104,5 @@ shinyApp(ui, server)
 }
 }
 \seealso{
-\code{\link{selectInput}}
+\code{\link{selectInput}} \code{\link{varSelectInput}}
 }
-

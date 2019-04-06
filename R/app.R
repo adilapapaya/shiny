@@ -41,6 +41,8 @@
 #' @examples
 #' ## Only run this example in interactive R sessions
 #' if (interactive()) {
+#'   options(device.ask.default = FALSE)
+#'
 #'   shinyApp(
 #'     ui = fluidPage(
 #'       numericInput("n", "n", 1),
@@ -69,7 +71,7 @@
 #' }
 #' @export
 shinyApp <- function(ui=NULL, server=NULL, onStart=NULL, options=list(),
-                     uiPattern="/", enableBookmarking = NULL) {
+                     uiPattern="/", enableBookmarking=NULL) {
   if (is.null(server)) {
     stop("`server` missing from shinyApp")
   }
@@ -168,7 +170,14 @@ shinyAppDir_serverR <- function(appDir, options=list()) {
   }
 
   wwwDir <- file.path.ci(appDir, "www")
+  if (dirExists(wwwDir)) {
+    staticPaths <- list("/" = staticPath(wwwDir, indexhtml = FALSE, fallthrough = TRUE))
+  } else {
+    staticPaths <- list()
+  }
+
   fallbackWWWDir <- system.file("www-dir", package = "shiny")
+
   serverSource <- cachedFuncWithFile(appDir, "server.R", case.sensitive = FALSE,
     function(serverR) {
       # If server.R contains a call to shinyServer (which sets .globals$server),
@@ -210,7 +219,7 @@ shinyAppDir_serverR <- function(appDir, options=list()) {
     if (file.exists(file.path.ci(appDir, "global.R")))
       sourceUTF8(file.path.ci(appDir, "global.R"))
   }
-  onEnd <- function() {
+  onStop <- function() {
     setwd(oldwd)
     monitorHandle()
     monitorHandle <<- NULL
@@ -218,10 +227,11 @@ shinyAppDir_serverR <- function(appDir, options=list()) {
 
   structure(
     list(
-      httpHandler = joinHandlers(c(uiHandler, wwwDir, fallbackWWWDir)),
+      staticPaths = staticPaths,
+      httpHandler = joinHandlers(c(uiHandler, fallbackWWWDir)),
       serverFuncSource = serverFuncSource,
       onStart = onStart,
-      onEnd = onEnd,
+      onStop = onStop,
       options = options
     ),
     class = "shiny.appobj"
@@ -307,6 +317,20 @@ shinyAppDir_appR <- function(fileName, appDir, options=list())
   }
 
   wwwDir <- file.path.ci(appDir, "www")
+  if (dirExists(wwwDir)) {
+    # wwwDir is a static path served by httpuv. It does _not_ serve up
+    # index.html, for two reasons. (1) It's possible that the user's
+    # www/index.html file is not actually used as the index, but as a template
+    # that gets processed before being sent; and (2) the index content may be
+    # modified by the hosting environment (as in SockJSAdapter.R).
+    #
+    # The call to staticPath normalizes the path, so that if the working dir
+    # later changes, it will continue to point to the right place.
+    staticPaths <- list("/" = staticPath(wwwDir, indexhtml = FALSE, fallthrough = TRUE))
+  } else {
+    staticPaths <- list()
+  }
+
   fallbackWWWDir <- system.file("www-dir", package = "shiny")
 
   oldwd <- NULL
@@ -315,8 +339,9 @@ shinyAppDir_appR <- function(fileName, appDir, options=list())
     oldwd <<- getwd()
     setwd(appDir)
     monitorHandle <<- initAutoReloadMonitor(appDir)
+    if (!is.null(appObj()$onStart)) appObj()$onStart()
   }
-  onEnd <- function() {
+  onStop <- function() {
     setwd(oldwd)
     monitorHandle()
     monitorHandle <<- NULL
@@ -324,10 +349,16 @@ shinyAppDir_appR <- function(fileName, appDir, options=list())
 
   structure(
     list(
-      httpHandler = joinHandlers(c(dynHttpHandler, wwwDir, fallbackWWWDir)),
+      # fallbackWWWDir is _not_ listed in staticPaths, because it needs to
+      # come after the uiHandler. It also does not need to be fast, since it
+      # should rarely be hit. The order is wwwDir (in staticPaths), then
+      # uiHandler, then falbackWWWDir (which is served up by the R
+      # staticHandler function).
+      staticPaths = staticPaths,
+      httpHandler = joinHandlers(c(dynHttpHandler, fallbackWWWDir)),
       serverFuncSource = dynServerFuncSource,
       onStart = onStart,
-      onEnd = onEnd,
+      onStop = onStop,
       options = options
     ),
     class = "shiny.appobj"
@@ -378,9 +409,10 @@ print.shiny.appobj <- function(x, ...) {
       c("port", "launch.browser", "host", "quiet",
         "display.mode", "test.mode")]
 
-  args <- c(list(x), opts)
+  # Quote x and put runApp in quotes so that there's a nicer stack trace (#1851)
+  args <- c(list(quote(x)), opts)
 
-  do.call(runApp, args)
+  do.call("runApp", args)
 }
 
 #' @rdname shinyApp

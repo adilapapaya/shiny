@@ -1,10 +1,16 @@
 function escapeHTML(str) {
-  return str.replace(/&/g, "&amp;")
-            .replace(/</g, "&lt;")
-            .replace(/>/g, "&gt;")
-            .replace(/"/g, "&quot;")
-            .replace(/'/g, "&#039;")
-            .replace(/\//g,"&#x2F;");
+  var escaped = {
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#039;",
+    "/": "&#x2F;"
+  };
+
+  return str.replace(/[&<>'"\/]/g, function(m) {
+    return escaped[m];
+  });
 }
 
 function randomId() {
@@ -48,6 +54,17 @@ function padZeros(n, digits) {
   while (str.length < digits)
     str = "0" + str;
   return str;
+}
+
+// Round to a specified number of significant digits.
+function roundSignif(x, digits = 1) {
+  if (digits < 1)
+    throw "Significant digits must be at least 1.";
+
+  // This converts to a string and back to a number, which is inelegant, but
+  // is less prone to FP rounding error than an alternate method which used
+  // Math.round().
+  return parseFloat(x.toPrecision(digits));
 }
 
 // Take a string with format "YYYY-MM-DD" and return a Date object.
@@ -144,7 +161,31 @@ function pixelRatio() {
 // "with" on the argument value, and return the result.
 function scopeExprToFunc(expr) {
   /*jshint evil: true */
-  var func = new Function("with (this) {return (" + expr + ");}");
+  var expr_escaped = expr
+    .replace(/[\\"']/g, '\\$&')
+    .replace(/\u0000/g, '\\0')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r')
+    // \b has a special meaning; need [\b] to match backspace char.
+    .replace(/[\b]/g, '\\b');
+
+  try {
+    var func = new Function(
+      `with (this) {
+        try {
+          return (${expr});
+        } catch (e) {
+          console.error('Error evaluating expression: ${expr_escaped}');
+          throw e;
+        }
+      }`
+    );
+  } catch (e) {
+    console.error("Error parsing expression: " + expr);
+    throw e;
+  }
+
+
   return function(scope) {
     return func.call(scope);
   };
@@ -200,4 +241,88 @@ function mergeSort(list, sortfunc) {
 // Escape jQuery selector metacharacters: !"#$%&'()*+,./:;<=>?@[\]^`{|}~
 var $escape = exports.$escape = function(val) {
   return val.replace(/([!"#$%&'()*+,.\/:;<=>?@\[\\\]^`{|}~])/g, '\\$1');
+};
+
+// Maps a function over an object, preserving keys. Like the mapValues
+// function from lodash.
+function mapValues(obj, f) {
+  const newObj = {};
+  for (let key in obj) {
+    if (obj.hasOwnProperty(key))
+      newObj[key] = f(obj[key], key, obj);
+  }
+  return newObj;
+}
+
+// This is does the same as Number.isNaN, but that function unfortunately does
+// not exist in any version of IE.
+function isnan(x) {
+  return typeof(x) === 'number' && isNaN(x);
+}
+
+// Binary equality function used by the equal function.
+function _equal(x, y) {
+  if ($.type(x) === "object" && $.type(y) === "object") {
+    if (Object.keys(x).length !== Object.keys(y).length) return false;
+    for (let prop in x)
+      if (!y.hasOwnProperty(prop) || !_equal(x[prop], y[prop]))
+        return false;
+    return true;
+  } else if ($.type(x) === "array" && $.type(y) === "array") {
+    if (x.length !== y.length) return false;
+    for (let i = 0; i < x.length; i++)
+      if (!_equal(x[i], y[i])) return false;
+    return true;
+  } else {
+    return (x === y);
+  }
+}
+
+// Structural or "deep" equality predicate. Tests two or more arguments for
+// equality, traversing arrays and objects (as determined by $.type) as
+// necessary.
+//
+// Objects other than objects and arrays are tested for equality using ===.
+function equal(...args) {
+  if (args.length < 2) throw new Error("equal requires at least two arguments.");
+  for (let i = 0; i < args.length-1; i++) {
+    if (!_equal(args[i], args[i+1]))
+      return false;
+  }
+  return true;
+};
+
+// Compare version strings like "1.0.1", "1.4-2". `op` must be a string like
+// "==" or "<".
+exports.compareVersion = function(a, op, b) {
+  function versionParts(ver) {
+    return (ver + "")
+      .replace(/-/, ".")
+      .replace(/(\.0)+[^\.]*$/, "")
+      .split(".");
+  }
+
+  function cmpVersion(a, b) {
+    a = versionParts(a);
+    b = versionParts(b);
+    var len = Math.min(a.length, b.length);
+    var cmp;
+
+    for(var i=0; i<len; i++) {
+      cmp = parseInt(a[i], 10) - parseInt(b[i], 10);
+      if(cmp !== 0) {
+        return cmp;
+      }
+    }
+    return a.length - b.length;
+  }
+
+  var diff = cmpVersion(a, b);
+
+  if (op === "==")      return (diff === 0);
+  else if (op === ">=") return (diff >=  0);
+  else if (op === ">")  return (diff >   0);
+  else if (op === "<=") return (diff <=  0);
+  else if (op === "<")  return (diff <   0);
+  else                  throw `Unknown operator: ${op}`;
 };

@@ -5,7 +5,7 @@ NULL
 #'
 #' Shiny makes it incredibly easy to build interactive web applications with R.
 #' Automatic "reactive" binding between inputs and outputs and extensive
-#' pre-built widgets make it possible to build beautiful, responsive, and
+#' prebuilt widgets make it possible to build beautiful, responsive, and
 #' powerful applications with minimal effort.
 #'
 #' The Shiny tutorial at \url{http://shiny.rstudio.com/tutorial/} explains
@@ -62,7 +62,7 @@ NULL
 #'     by setting e.g. \code{options(shiny.autoreload.interval = 2000)} (every
 #'     two seconds).}
 #'   \item{shiny.reactlog}{If \code{TRUE}, enable logging of reactive events,
-#'     which can be viewed later with the \code{\link{showReactLog}} function.
+#'     which can be viewed later with the \code{\link{reactlogShow}} function.
 #'     This incurs a substantial performance penalty and should not be used in
 #'     production.}
 #'   \item{shiny.usecairo}{This is used to disable graphical rendering by the
@@ -142,6 +142,15 @@ toJSON <- function(x, ...,  dataframe = "columns", null = "null", na = "null",
    keep_vec_names = keep_vec_names, json_verbatim = TRUE, ...)
 }
 
+# If the input to jsonlite::fromJSON is not valid JSON, it will try to fetch a
+# URL or read a file from disk. We don't want to allow that.
+safeFromJSON <- function(txt, ...) {
+  if (!jsonlite::validate(txt)) {
+    stop("Argument 'txt' is not a valid JSON string.")
+  }
+  jsonlite::fromJSON(txt, ...)
+}
+
 # Call the workerId func with no args to get the worker id, and with an arg to
 # set it.
 #
@@ -201,12 +210,13 @@ workerId <- local({
 #'     }
 #'     \item{\code{singletons} - for internal use}
 #'     \item{\code{url_protocol}, \code{url_hostname}, \code{url_port},
-#'       \code{url_pathname}, \code{url_search}, and \code{url_hash_initial}
-#'       can be used to get the components of the URL that was requested by the
-#'       browser to load the Shiny app page. These values are from the
-#'       browser's perspective, so neither HTTP proxies nor Shiny Server will
-#'       affect these values. The \code{url_search} value may be used with
-#'       \code{\link{parseQueryString}} to access query string parameters.
+#'       \code{url_pathname}, \code{url_search}, \code{url_hash_initial}
+#'       and \code{url_hash} can be used to get the components of the URL
+#'       that was requested by the browser to load the Shiny app page.
+#'       These values are from the browser's perspective, so neither HTTP
+#'       proxies nor Shiny Server will affect these values. The
+#'       \code{url_search} value may be used with \code{\link{parseQueryString}}
+#'       to access query string parameters.
 #'     }
 #'   }
 #'   \code{clientData} also contains information about each output.
@@ -276,6 +286,10 @@ workerId <- local({
 #'   This is the request that was used to initiate the websocket connection
 #'   (as opposed to the request that downloaded the web page for the app).
 #' }
+#' \item{userData}{
+#'   An environment for app authors and module/package authors to store whatever
+#'   session-specific data they want.
+#' }
 #' \item{resetBrush(brushId)}{
 #'   Resets/clears the brush with the given \code{brushId}, if it exists on
 #'   any \code{imageOutput} or \code{plotOutput} in the app.
@@ -296,7 +310,8 @@ workerId <- local({
 #'   Similar to \code{sendCustomMessage}, but the message must be a raw vector
 #'   and the registration method on the client is
 #'   \code{Shiny.addBinaryMessageHandler(type, function(message){...})}. The
-#'   message argument on the client will be a \href{https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/DataView}{DataView}.
+#'   message argument on the client will be a
+#'   \href{https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/DataView}{DataView}.
 #' }
 #' \item{sendInputMessage(inputId, message)}{
 #'   Sends a message to an input on the session's client web page; if the input
@@ -370,12 +385,24 @@ NULL
 #' @seealso \url{http://shiny.rstudio.com/articles/modules.html}
 #' @export
 NS <- function(namespace, id = NULL) {
+  if (length(namespace) == 0)
+    ns_prefix <- character(0)
+  else
+    ns_prefix <- paste(namespace, collapse = ns.sep)
+
+  f <- function(id) {
+    if (length(id) == 0)
+      return(ns_prefix)
+    if (length(ns_prefix) == 0)
+      return(id)
+
+    paste(ns_prefix, id, sep = ns.sep)
+  }
+
   if (missing(id)) {
-    function(id) {
-      paste(c(namespace, id), collapse = ns.sep)
-    }
+    f
   } else {
-    paste(c(namespace, id), collapse = ns.sep)
+    f(id)
   }
 }
 
@@ -394,6 +421,7 @@ ShinySession <- R6Class(
     invalidatedOutputValues = 'Map',
     invalidatedOutputErrors = 'Map',
     inputMessageQueue = list(), # A list of inputMessages to send when flushed
+    cycleStartActionQueue = list(), # A list of actions to perform to start a cycle
     .outputs = list(),          # Keeps track of all the output observer objects
     .outputOptions = list(),     # Options for each of the output observer objects
     progressKeys = 'character',
@@ -411,10 +439,14 @@ ShinySession <- R6Class(
     restoreCallbacks = 'Callbacks',
     restoredCallbacks = 'Callbacks',
     bookmarkExclude = character(0),  # Names of inputs to exclude from bookmarking
+    getBookmarkExcludeFuns = list(),
+    timingRecorder = 'ShinyServerTimingRecorder',
 
     testMode = FALSE,                # Are we running in test mode?
     testExportExprs = list(),
     outputValues = list(),           # Saved output values (for testing mode)
+    currentOutputName = NULL,        # Name of the currently-running output
+    outputInfo = list(),             # List of information for each output
     testSnapshotUrl = character(0),
 
     sendResponse = function(requestMsg, value) {
@@ -461,6 +493,16 @@ ShinySession <- R6Class(
         return(defaultValue)
       return(result)
     },
+    withCurrentOutput = function(name, expr) {
+      if (!is.null(private$currentOutputName)) {
+        stop("Nested calls to withCurrentOutput() are not allowed.")
+      }
+
+      promises::with_promise_domain(
+        createVarPromiseDomain(private, "currentOutputName", name),
+        expr
+      )
+    },
     shouldSuspend = function(name) {
       # Find corresponding hidden state clientData variable, with the format
       # "output_foo_hidden". (It comes from .clientdata_output_foo_hidden
@@ -486,9 +528,885 @@ ShinySession <- R6Class(
       self$onSessionEnded(private$fileUploadContext$rmUploadDirs)
     },
 
+    # Modules (scopes) call this to register a function that returns a vector
+    # of names to exclude from bookmarking. The function should return
+    # something like c("scope1-x", "scope1-y"). This doesn't use a Callback
+    # object because the return values of the functions are needed, but
+    # Callback$invoke() discards return values.
+    registerBookmarkExclude = function(fun) {
+      len <- length(private$getBookmarkExcludeFuns) + 1
+      private$getBookmarkExcludeFuns[[len]] <- fun
+    },
+
+    # Save output values and errors. This is only used for testing mode.
+    storeOutputValues = function(values = NULL) {
+      private$outputValues <- mergeVectors(private$outputValues, values)
+    },
+
+    enableTestSnapshot = function() {
+      private$testSnapshotUrl <- self$registerDataObj("shinytest", NULL,
+        function(data, req) {
+          if (!isTRUE(private$testMode)) {
+            return()
+          }
+
+          params <- parseQueryString(req$QUERY_STRING)
+          # The format of the response that will be sent back. Defaults to
+          # "json" unless requested otherwise. The only other valid value is
+          # "rds".
+          format <- params$format %OR% "json"
+
+          values <- list()
+
+          if (!is.null(params$input)) {
+
+            allInputs <- isolate(
+              reactiveValuesToList(self$input, all.names = TRUE)
+            )
+
+            # If params$input is "1", return all; otherwise return just the
+            # inputs that are named in params$input, like "x,y,z".
+            if (params$input == "1") {
+              values$input <- allInputs
+            } else {
+              items <- strsplit(params$input, ",")[[1]]
+              items <- intersect(items, names(allInputs))
+              values$input <- allInputs[items]
+            }
+
+            # Apply preprocessor functions for inputs that have them.
+            values$input <- lapply(
+              stats::setNames(names(values$input), names(values$input)),
+              function(name) {
+                preprocess <- private$getSnapshotPreprocessInput(name)
+                preprocess(values$input[[name]])
+              }
+            )
+
+            values$input <- sortByName(values$input)
+          }
+
+          if (!is.null(params$output)) {
+
+            if (params$output == "1") {
+              values$output <- private$outputValues
+            } else {
+              items <- strsplit(params$output, ",")[[1]]
+              items <- intersect(items, names(private$outputValues))
+              values$output <- private$outputValues[items]
+            }
+
+            # Filter out those outputs that have the snapshotExclude attribute.
+            exclude_idx <- vapply(names(values$output), function(name) {
+              isTRUE(attr(private$.outputs[[name]], "snapshotExclude", TRUE))
+            }, logical(1))
+            values$output <- values$output[!exclude_idx]
+
+            # Apply snapshotPreprocess functions for outputs that have them.
+            values$output <- lapply(
+              stats::setNames(names(values$output), names(values$output)),
+              function(name) {
+                preprocess <- private$getSnapshotPreprocessOutput(name)
+                preprocess(values$output[[name]])
+              }
+            )
+
+            values$output <- sortByName(values$output)
+          }
+
+          if (!is.null(params$export)) {
+
+            if (params$export == "1") {
+              values$export <- isolate(
+                lapply(private$testExportExprs, function(item) {
+                  eval(item$expr, envir = item$env)
+                })
+              )
+            } else {
+              items <- strsplit(params$export, ",")[[1]]
+              items <- intersect(items, names(private$testExportExprs))
+              values$export <- isolate(
+                lapply(private$testExportExprs[items], function(item) {
+                  eval(item$expr, envir = item$env)
+                })
+              )
+            }
+
+            values$export <- sortByName(values$export)
+          }
+
+          # Make sure input, output, and export are all named lists (at this
+          # point, they could be unnamed if they are empty lists). This is so
+          # that the resulting object is represented as an object in JSON
+          # instead of an array, and so that the RDS data structure is of a
+          # consistent type.
+          values <- lapply(values, asNamedVector)
+
+          if (length(values) == 0) {
+            return(httpResponse(400, "text/plain",
+              "None of export, input, or output requested."
+            ))
+          }
+
+          if (identical(format, "json")) {
+            content <- toJSON(values, pretty = TRUE)
+            httpResponse(200, "application/json", content)
+
+          } else if (identical(format, "rds")) {
+            tmpfile <- tempfile("shinytest", fileext = ".rds")
+            saveRDS(values, tmpfile)
+            on.exit(unlink(tmpfile), add = TRUE)
+
+            content <- readBin(tmpfile, "raw", n = file.info(tmpfile)$size)
+            httpResponse(200, "application/octet-stream", content)
+
+          } else {
+            httpResponse(400, "text/plain", paste("Invalid format requested:", format))
+          }
+        }
+      )
+    },
+
+    # Get the snapshotPreprocessOutput function for an output name. If no preprocess
+    # function has been set, return the identity function.
+    getSnapshotPreprocessOutput = function(name) {
+      fun <- attr(private$.outputs[[name]], "snapshotPreprocess", exact = TRUE)
+      fun %OR% identity
+    },
+
+    # Get the snapshotPreprocessInput function for an input name. If no preprocess
+    # function has been set, return the identity function.
+    getSnapshotPreprocessInput = function(name) {
+      fun <- private$.input$getMeta(name, "shiny.snapshot.preprocess")
+      fun %OR% identity
+    },
+
+    # See cycleStartAction
+    startCycle = function() {
+      # TODO: This should check for busyCount == 0L, and remove the checks from
+      # the call sites
+      if (length(private$cycleStartActionQueue) > 0) {
+        head <- private$cycleStartActionQueue[[1L]]
+        private$cycleStartActionQueue <- private$cycleStartActionQueue[-1L]
+
+        # After we execute the current cycleStartAction (head), there may be
+        # more items left on the queue. If the current busyCount > 0, then that
+        # means an async task is running; whenever that task finishes, it will
+        # decrement the busyCount back to 0 and a startCycle will then be
+        # scheduled. But if the current busyCount is 0, it means that either
+        # busyCount was incremented and then decremented; OR that running head()
+        # never touched busyCount (one example of the latter is that an input
+        # changed that didn't actually cause any observers to be invalidated,
+        # i.e. an input that's used in the body of an observeEvent). Because of
+        # the possibility of the latter case, we need to conditionally schedule
+        # a startCycle ourselves to ensure that the remaining queue items get
+        # processed.
+        #
+        # Since we can't actually tell whether head() increment and decremented
+        # busyCount, it's possible we're calling startCycle spuriously; that's
+        # OK, it's essentially a no-op in that case.
+        on.exit({
+          if (private$busyCount == 0L && length(private$cycleStartActionQueue) > 0L) {
+            later::later(function() {
+              if (private$busyCount == 0L) {
+                private$startCycle()
+              }
+            })
+          }
+        }, add = TRUE)
+
+        head()
+      }
+
+      invisible()
+    }
+  ),
+  public = list(
+    restoreContext = NULL,
+    progressStack = 'Stack', # Stack of progress objects
+    input       = 'reactivevalues', # Externally-usable S3 wrapper object for .input
+    output      = 'ANY',    # Externally-usable S3 wrapper object for .outputs
+    clientData  = 'reactivevalues', # Externally-usable S3 wrapper object for .clientData
+    token = 'character',  # Used to identify this instance in URLs
+    files = 'Map',        # For keeping track of files sent to client
+    downloads = 'Map',
+    closed = logical(0),
+    request = 'ANY',      # Websocket request object
+    singletons = character(0),  # Tracks singleton HTML fragments sent to the page
+    userData = 'environment',
+    cache = NULL,         # A cache object used in the session
+    user = NULL,
+    groups = NULL,
+
+    initialize = function(websocket) {
+      private$websocket <- websocket
+      self$closed <- FALSE
+      # TODO: Put file upload context in user/app-specific dir if possible
+
+      private$invalidatedOutputValues <- Map$new()
+      private$invalidatedOutputErrors <- Map$new()
+      private$fileUploadContext <- FileUploadContext$new()
+      private$closedCallbacks <- Callbacks$new()
+      private$flushCallbacks <- Callbacks$new()
+      private$flushedCallbacks <- Callbacks$new()
+      private$inputReceivedCallbacks <- Callbacks$new()
+      private$.input      <- ReactiveValues$new(dedupe = FALSE, label = "input")
+      private$.clientData <- ReactiveValues$new(dedupe = TRUE, label = "clientData")
+      private$timingRecorder <- ShinyServerTimingRecorder$new()
+      self$progressStack <- Stack$new()
+      self$files <- Map$new()
+      self$downloads <- Map$new()
+      self$userData <- new.env(parent = emptyenv())
+
+      self$input <- .createReactiveValues(private$.input, readonly=TRUE)
+      self$clientData <- .createReactiveValues(private$.clientData, readonly=TRUE)
+
+      self$output <- .createOutputWriter(self)
+
+      self$token <- createUniqueId(16)
+      private$.outputs <- list()
+      private$.outputOptions <- list()
+
+      self$cache <- MemoryCache$new()
+
+      private$bookmarkCallbacks <- Callbacks$new()
+      private$bookmarkedCallbacks <- Callbacks$new()
+      private$restoreCallbacks <- Callbacks$new()
+      private$restoredCallbacks <- Callbacks$new()
+
+      private$testMode <- .globals$testMode
+      private$enableTestSnapshot()
+
+      private$registerSessionEndCallbacks()
+
+      if (!is.null(websocket$request$HTTP_SHINY_SERVER_CREDENTIALS)) {
+        try({
+          creds <- safeFromJSON(websocket$request$HTTP_SHINY_SERVER_CREDENTIALS)
+          self$user <- creds$user
+          self$groups <- creds$groups
+        }, silent=FALSE)
+      }
+
+      # session$request should throw an error if httpuv doesn't have
+      # websocket$request, but don't throw it until a caller actually
+      # tries to access session$request
+      delayedAssign('request', websocket$request, assign.env = self)
+
+      private$sendMessage(
+        config = list(
+          workerId = workerId(),
+          sessionId = self$token,
+          user = self$user
+        )
+      )
+    },
+    startTiming = function(guid) {
+      if (!is.null(guid)) {
+        private$timingRecorder$start(guid)
+        self$onFlush(private$timingRecorder$stop)
+      }
+    },
+    requestFlush = function() {
+      appsNeedingFlush$set(self$token, self)
+    },
+    rootScope = function() {
+      self
+    },
+    makeScope = function(namespace) {
+      ns <- NS(namespace)
+
+      # Private items for this scope. Can't be part of the scope object because
+      # `$<-.session_proxy` doesn't allow assignment on overidden names.
+      bookmarkCallbacks <- Callbacks$new()
+      restoreCallbacks  <- Callbacks$new()
+      restoredCallbacks <- Callbacks$new()
+      bookmarkExclude   <- character(0)
+
+      scope <- createSessionProxy(self,
+        input = .createReactiveValues(private$.input, readonly = TRUE, ns = ns),
+        output = .createOutputWriter(self, ns = ns),
+        sendInputMessage = function(inputId, message) {
+          .subset2(self, "sendInputMessage")(ns(inputId), message)
+        },
+        registerDataObj = function(name, data, filterFunc) {
+          .subset2(self, "registerDataObj")(ns(name), data, filterFunc)
+        },
+        ns = ns,
+        makeScope = function(namespace) {
+          self$makeScope(ns(namespace))
+        },
+
+        setBookmarkExclude = function(names) {
+          bookmarkExclude <<- names
+        },
+        getBookmarkExclude = function() {
+          bookmarkExclude
+        },
+        onBookmark = function(fun) {
+          if (!is.function(fun) || length(fun) != 1) {
+            stop("`fun` must be a function that takes one argument")
+          }
+          bookmarkCallbacks$register(fun)
+        },
+        onBookmarked = function(fun) {
+          stop("onBookmarked() can't be used in a module.")
+        },
+        onRestore = function(fun) {
+          if (!is.function(fun) || length(fun) != 1) {
+            stop("`fun` must be a function that takes one argument")
+          }
+          restoreCallbacks$register(fun)
+        },
+        onRestored = function(fun) {
+          if (!is.function(fun) || length(fun) != 1) {
+            stop("`fun` must be a function that takes one argument")
+          }
+          restoredCallbacks$register(fun)
+        },
+        exportTestValues = function(..., quoted_ = FALSE, env_ = parent.frame()) {
+          if (quoted_) {
+            dots <- list(...)
+          } else {
+            dots <- eval(substitute(alist(...)))
+          }
+
+          if (anyUnnamed(dots))
+            stop("exportTestValues: all arguments must be named.")
+
+          names(dots) <- ns(names(dots))
+
+          do.call(
+            .subset2(self, "exportTestValues"),
+            c(dots, quoted_ = TRUE, env_ = env_),
+            quote = TRUE
+          )
+        }
+      )
+
+      # Given a char vector, return a logical vector indicating which of those
+      # strings are names of things in the namespace.
+      filterNamespace <- function(x) {
+        nsString <- paste0(namespace, ns.sep)
+        substr(x, 1, nchar(nsString)) == nsString
+      }
+
+      # Given a char vector of namespaced names, return a char vector of corresponding
+      # names with namespace prefix removed.
+      unNamespace <- function(x) {
+        if (!all(filterNamespace(x))) {
+          stop("x contains strings(s) that do not have namespace prefix ", namespace)
+        }
+
+        nsString <- paste0(namespace, ns.sep)
+        substring(x, nchar(nsString) + 1)
+      }
+
+      # Given a restore state object (a list), return a modified version that's
+      # scoped to this namespace.
+      scopeRestoreState <- function(state) {
+        # State is a list. We need to copy and transform some things for the
+        # scope.
+        scopeState <- state
+        # `values` is an environment and we don't want to modify the original.
+        scopeState$values <- new.env(parent = emptyenv())
+
+        # Keep only inputs that are in the scope, and rename them
+        scopeState$input <- scopeState$input[filterNamespace(names(scopeState$input))]
+        names(scopeState$input) <- unNamespace(names(scopeState$input))
+
+        # Same for values. This is an environment so we have to handle a little
+        # differently.
+        origNames <- names(state$values)
+        origNames <- origNames[filterNamespace(origNames)]
+        lapply(origNames, function(origName) {
+          scopedName <- unNamespace(origName)
+          scopeState$values[[scopedName]] <- state$values[[origName]]
+        })
+
+        if (!is.null(state$dir)) {
+          dir <- file.path(state$dir, namespace)
+          if (dirExists(dir))
+            scopeState$dir <- dir
+        }
+
+        scopeState
+      }
+
+      # When scope is created, register these bookmarking callbacks on the main
+      # session object. They will invoke the scope's own callbacks, if any are
+      # present.
+      self$onBookmark(function(state) {
+        # Exit if no user-defined callbacks.
+        if (bookmarkCallbacks$count() == 0)
+          return()
+
+        scopeState <- ShinySaveState$new(scope$input, scope$getBookmarkExclude())
+
+        # Create subdir for this scope
+        if (!is.null(state$dir)) {
+          scopeState$dir <- file.path(state$dir, namespace)
+          if (!dirExists(scopeState$dir)) {
+            res <- dir.create(scopeState$dir)
+            if (res == FALSE) {
+              stop("Error creating subdirectory for scope ", namespace)
+            }
+          }
+        }
+
+        # Invoke the callback on the scopeState object
+        bookmarkCallbacks$invoke(scopeState)
+
+        # Copy `values` from scopeState to state, adding namespace
+        if (length(scopeState$values) != 0) {
+          if (anyUnnamed(scopeState$values)) {
+            stop("All scope values in must be named.")
+          }
+
+          lapply(names(scopeState$values), function(origName) {
+            scopedName <- ns(origName)
+            state$values[[scopedName]] <- scopeState$values[[origName]]
+          })
+        }
+      })
+
+      self$onRestore(function(state) {
+        # Exit if no user-defined callbacks.
+        if (restoreCallbacks$count() == 0)
+          return()
+
+        scopeState <- scopeRestoreState(state)
+        # Invoke user callbacks
+        restoreCallbacks$invoke(scopeState)
+      })
+
+      self$onRestored(function(state) {
+        # Exit if no user-defined callbacks.
+        if (restoredCallbacks$count() == 0)
+          return()
+
+        scopeState <- scopeRestoreState(state)
+        # Invoke user callbacks
+        restoredCallbacks$invoke(scopeState)
+      })
+
+      # Returns the excluded names with the scope's ns prefix on them.
+      private$registerBookmarkExclude(function() {
+        excluded <- scope$getBookmarkExclude()
+        ns(excluded)
+      })
+
+      scope
+    },
+    ns = function(id) {
+      NS(NULL, id)
+    },
+
+    # Freeze a value until the flush cycle completes
+    freezeValue = function(x, name) {
+      if (!is.reactivevalues(x))
+        stop("x must be a reactivevalues object")
+
+      impl <- .subset2(x, 'impl')
+      key <- .subset2(x, 'ns')(name)
+      impl$freeze(key)
+      self$onFlushed(function() impl$thaw(key))
+    },
+
+    onSessionEnded = function(sessionEndedCallback) {
+      "Registers the given callback to be invoked when the session is closed
+      (i.e. the connection to the client has been severed). The return value
+      is a function which unregisters the callback. If multiple callbacks are
+      registered, the order in which they are invoked is not guaranteed."
+      return(private$closedCallbacks$register(sessionEndedCallback))
+    },
+    onEnded = function(endedCallback) {
+      "Synonym for onSessionEnded"
+      return(self$onSessionEnded(endedCallback))
+    },
+    onInputReceived = function(callback) {
+      "Registers the given callback to be invoked when the session receives
+      new data from the client."
+      return(private$inputReceivedCallbacks$register(callback))
+    },
+    unhandledError = function(e) {
+      self$close()
+    },
+    close = function() {
+      if (!self$closed) {
+        private$websocket$close()
+      }
+    },
+    wsClosed = function() {
+      self$closed <- TRUE
+      for (output in private$.outputs) {
+        output$suspend()
+      }
+      # ..stacktraceon matches with the top-level ..stacktraceoff..
+      private$closedCallbacks$invoke(onError = printError, ..stacktraceon = TRUE)
+    },
+    isClosed = function() {
+      return(self$closed)
+    },
+    isEnded = function() {
+      return(self$isClosed())
+    },
+    setShowcase = function(value) {
+      private$showcase <- !is.null(value) && as.logical(value)
+    },
+
+    allowReconnect = function(value) {
+      if (!(identical(value, TRUE) || identical(value, FALSE) || identical(value, "force"))) {
+        stop('value must be TRUE, FALSE, or "force"')
+      }
+      private$write(toJSON(list(allowReconnect = value)))
+    },
+
+    defineOutput = function(name, func, label) {
+      "Binds an output generating function to this name. The function can either
+      take no parameters, or have named parameters for \\code{name} and
+      \\code{shinysession} (in the future this list may expand, so it is a good idea
+      to also include \\code{...} in your function signature)."
+
+      # jcheng 08/31/2012: User submitted an example of a dynamically calculated
+      # name not working unless name was eagerly evaluated. Yikes!
+      force(name)
+
+      # If overwriting an output object, destroy the previous copy of it
+      if (!is.null(private$.outputs[[name]])) {
+        private$.outputs[[name]]$destroy()
+      }
+
+      if (is.null(func)) {
+        # If func is null, give it an "empty" output function so it can go
+        # through the logic below. If we simply returned at this point, the
+        # previous output (if any) would continue to show in the client.
+        func <- missingOutput
+      }
+
+      if (is.function(func)) {
+        # Extract any output attributes attached to the render function. These
+        # will be attached to the observer after it's created.
+        outputAttrs <- attr(func, "outputAttrs", TRUE)
+
+        funcFormals <- formals(func)
+        # ..stacktraceon matches with the top-level ..stacktraceoff.., because
+        # the observer we set up below has ..stacktraceon=FALSE
+        func <- wrapFunctionLabel(func, paste0("output$", name), ..stacktraceon = TRUE)
+        if (length(funcFormals) != 0) {
+          orig <- func
+          func <- function() {
+            orig(name=name, shinysession=self)
+          }
+        }
+
+        # Preserve source reference and file information when formatting the
+        # label for display in the reactive graph
+        srcref <- attr(label, "srcref")
+        srcfile <- attr(label, "srcfile")
+        label <- sprintf('output$%s', name)
+        attr(label, "srcref") <- srcref
+        attr(label, "srcfile") <- srcfile
+
+        obs <- observe(..stacktraceon = FALSE, {
+
+          private$sendMessage(recalculating = list(
+            name = name, status = 'recalculating'
+          ))
+
+          # This shinyCallingHandlers should maybe be at a higher level,
+          # to include the $then/$catch calls below?
+          hybrid_chain(
+            hybrid_chain(
+              {
+                private$withCurrentOutput(name, {
+                  shinyCallingHandlers(func())
+                })
+              },
+              catch = function(cond) {
+                if (inherits(cond, "shiny.custom.error")) {
+                  if (isTRUE(getOption("show.error.messages"))) printError(cond)
+                  structure(list(), class = "try-error", condition = cond)
+                } else if (inherits(cond, "shiny.output.cancel")) {
+                  structure(list(), class = "cancel-output")
+                } else if (inherits(cond, "shiny.silent.error")) {
+                  # Don't let shiny.silent.error go through the normal stop
+                  # path of try, because we don't want it to print. But we
+                  # do want to try to return the same looking result so that
+                  # the code below can send the error to the browser.
+                  structure(list(), class = "try-error", condition = cond)
+                } else {
+                  if (isTRUE(getOption("show.error.messages"))) printError(cond)
+                  if (getOption("shiny.sanitize.errors", FALSE)) {
+                    cond <- simpleError(paste("An error has occurred. Check your",
+                      "logs or contact the app author for",
+                      "clarification."))
+                  }
+                  invisible(structure(list(), class = "try-error", condition = cond))
+                }
+              }
+            ),
+            function(value) {
+              # Needed so that Shiny knows to flush the outputs. Even if no
+              # outputs/errors are queued, it's necessary to flush so that the
+              # client knows that progress is over.
+              self$requestFlush()
+
+              private$sendMessage(recalculating = list(
+                name = name, status = 'recalculated'
+              ))
+
+              if (inherits(value, "cancel-output")) {
+                return()
+              }
+
+              private$invalidatedOutputErrors$remove(name)
+              private$invalidatedOutputValues$remove(name)
+
+              if (inherits(value, 'try-error')) {
+                cond <- attr(value, 'condition')
+                type <- setdiff(class(cond), c('simpleError', 'error', 'condition'))
+                private$invalidatedOutputErrors$set(
+                  name,
+                  list(message = cond$message,
+                    call = utils::capture.output(print(cond$call)),
+                    type = if (length(type)) type))
+              }
+              else
+                private$invalidatedOutputValues$set(name, value)
+            }
+          )
+        }, suspended=private$shouldSuspend(name), label=label)
+
+        # If any output attributes were added to the render function attach
+        # them to observer.
+        lapply(names(outputAttrs), function(name) {
+          attr(obs, name) <- outputAttrs[[name]]
+        })
+
+        obs$onInvalidate(function() {
+          self$showProgress(name)
+        })
+
+        private$.outputs[[name]] <- obs
+        if (is.null(private$.outputOptions[[name]]))
+          private$.outputOptions[[name]] <- list()
+      }
+      else {
+        stop(paste("Unexpected", class(func), "output for", name))
+      }
+    },
+    flushOutput = function() {
+      if (private$busyCount > 0)
+        return()
+
+      appsNeedingFlush$remove(self$token)
+
+      if (self$isClosed())
+        return()
+
+      # Return TRUE if there's any stuff to send to the client.
+      hasPendingUpdates <- function() {
+        # Even though progressKeys isn't sent to the client, we use it in this
+        # check. This is because if it is non-empty, sending `values` to the
+        # client tells it that the flushReact loop is finished, and the client
+        # then knows to stop showing progress.
+        return(
+          length(private$progressKeys) != 0 ||
+          length(private$invalidatedOutputValues) != 0 ||
+          length(private$invalidatedOutputErrors) != 0 ||
+          length(private$inputMessageQueue) != 0
+        )
+      }
+
+      withReactiveDomain(self, {
+        # ..stacktraceon matches with the top-level ..stacktraceoff..
+        private$flushCallbacks$invoke(..stacktraceon = TRUE)
+
+        # Schedule execution of onFlushed callbacks
+        on.exit({
+          withReactiveDomain(self, {
+            # ..stacktraceon matches with the top-level ..stacktraceoff..
+            private$flushedCallbacks$invoke(..stacktraceon = TRUE)
+          })
+        }, add = TRUE)
+
+        if (!hasPendingUpdates()) {
+          # Normally, if there are no updates, simply return without sending
+          # anything to the client. But if we are in test mode, we still want to
+          # send a message with blank `values`, so that the client knows that
+          # any changed inputs have been received by the server and processed.
+          if (isTRUE(private$testMode)) {
+            private$sendMessage( values = list() )
+          }
+          return(invisible())
+        }
+
+        private$progressKeys <- character(0)
+        values <- as.list(private$invalidatedOutputValues)
+        private$invalidatedOutputValues <- Map$new()
+        errors <- as.list(private$invalidatedOutputErrors)
+        private$invalidatedOutputErrors <- Map$new()
+        inputMessages <- private$inputMessageQueue
+        private$inputMessageQueue <- list()
+
+        if (isTRUE(private$testMode)) {
+          private$storeOutputValues(mergeVectors(values, errors))
+        }
+
+        private$sendMessage(
+          errors = errors,
+          values = values,
+          inputMessages = inputMessages
+        )
+      })
+    },
+    # Schedule an action to execute not (necessarily) now, but when no observers
+    # that belong to this session are busy executing. This helps prevent (but
+    # does not guarantee) inputs and reactive values from changing underneath
+    # async observers as they run.
+    cycleStartAction = function(callback) {
+      private$cycleStartActionQueue <- c(private$cycleStartActionQueue, list(callback))
+      # If no observers are running in this session, we're safe to proceed.
+      # Otherwise, startCycle() will be called later, via decrementBusyCount().
+      if (private$busyCount == 0L) {
+        private$startCycle()
+      }
+    },
+    showProgress = function(id) {
+      'Send a message to the client that recalculation of the output identified
+      by \\code{id} is in progress. There is currently no mechanism for
+      explicitly turning off progress for an output component; instead, all
+      progress is implicitly turned off when flushOutput is next called.'
+
+      # If app is already closed, be sure not to show progress, otherwise we
+      # will get an error because of the closed websocket
+      if (self$closed)
+        return()
+
+      if (id %in% private$progressKeys)
+        return()
+
+      private$progressKeys <- c(private$progressKeys, id)
+
+      self$sendProgress('binding', list(id = id))
+    },
+    sendProgress = function(type, message) {
+      private$sendMessage(
+        progress = list(type = type, message = message)
+      )
+    },
+    sendNotification = function(type, message) {
+      private$sendMessage(
+        notification = list(type = type, message = message)
+      )
+    },
+    sendModal = function(type, message) {
+      private$sendMessage(
+        modal = list(type = type, message = message)
+      )
+    },
+    dispatch = function(msg) {
+      method <- paste('@', msg$method, sep='')
+      func <- try(self[[method]], silent = TRUE)
+      if (inherits(func, 'try-error')) {
+        private$sendErrorResponse(msg, paste('Unknown method', msg$method))
+      }
+
+      value <- try(do.call(func, as.list(append(msg$args, msg$blobs))),
+                   silent=TRUE)
+      if (inherits(value, 'try-error')) {
+        private$sendErrorResponse(msg, conditionMessage(attr(value, 'condition')))
+      }
+      else {
+        private$sendResponse(msg, value)
+      }
+    },
+    sendBinaryMessage = function(type, message) {
+      typeBytes <- charToRaw(type)
+      if (length(typeBytes) > 255) {
+        stop("'type' argument is too long")
+      }
+      private$write(c(as.raw(length(typeBytes)), typeBytes, message))
+    },
+    sendCustomMessage = function(type, message) {
+      data <- list()
+      data[[type]] <- message
+      private$sendMessage(custom = data)
+    },
+    sendInputMessage = function(inputId, message) {
+      data <- list(id = inputId, message = message)
+
+      # Add to input message queue
+      private$inputMessageQueue[[length(private$inputMessageQueue) + 1]] <- data
+      # Needed so that Shiny knows to actually flush the input message queue
+      self$requestFlush()
+    },
+    onFlush = function(flushCallback, once = TRUE) {
+      if (!isTRUE(once)) {
+        return(private$flushCallbacks$register(flushCallback))
+      } else {
+        dereg <- private$flushCallbacks$register(function() {
+          dereg()
+          flushCallback()
+        })
+        return(dereg)
+      }
+    },
+    onFlushed = function(flushedCallback, once = TRUE) {
+      if (!isTRUE(once)) {
+        return(private$flushedCallbacks$register(flushedCallback))
+      } else {
+        dereg <- private$flushedCallbacks$register(function() {
+          dereg()
+          flushedCallback()
+        })
+        return(dereg)
+      }
+    },
+
+    getCurrentOutputInfo = function() {
+      name <- private$currentOutputName
+
+      tmp_info <- private$outputInfo[[name]] %OR% list(name = name)
+
+      # cd_names() returns names of all items in clientData, without taking a
+      # reactive dependency. It is a function and it's memoized, so that we do
+      # the (relatively) expensive isolate(names(...)) call only when needed,
+      # and at most one time in this function.
+      .cd_names <- NULL
+      cd_names <- function() {
+        if (is.null(.cd_names)) {
+          .cd_names <<- isolate(names(self$clientData))
+        }
+        .cd_names
+      }
+
+      # If we don't already have width for this output info, see if it's
+      # present, and if so, add it.
+      if (! ("width" %in% names(tmp_info)) ) {
+        width_name  <- paste0("output_", name, "_width")
+        if (width_name %in% cd_names()) {
+          tmp_info$width <- reactive({
+            self$clientData[[width_name]]
+          })
+        }
+      }
+
+      if (! ("height" %in% names(tmp_info)) ) {
+        height_name  <- paste0("output_", name, "_height")
+        if (height_name %in% cd_names()) {
+          tmp_info$height <- reactive({
+            self$clientData[[height_name]]
+          })
+        }
+      }
+
+      private$outputInfo[[name]] <- tmp_info
+      private$outputInfo[[name]]
+    },
+
     createBookmarkObservers = function() {
-      # This is to be called from the initialization. It registers observers
-      # for bookmarking to work.
+      # This registers observers for bookmarking to work.
 
       # Get bookmarking config
       store <- getShinyOption("bookmarkStore", default = "disable")
@@ -575,687 +1493,16 @@ ShinySession <- R6Class(
       }) # withReactiveDomain
     },
 
-    # Save output values and errors. This is only used for testing mode.
-    storeOutputValues = function(values = NULL) {
-      private$outputValues <- mergeVectors(private$outputValues, values)
-    },
-
-    enableTestSnapshot = function() {
-      private$testSnapshotUrl <- self$registerDataObj("shinytest", NULL,
-        function(data, req) {
-          if (!isTRUE(private$testMode)) {
-            return()
-          }
-
-          params <- parseQueryString(req$QUERY_STRING)
-          # The format of the response that will be sent back. Defaults to
-          # "json" unless requested otherwise. The only other valid value is
-          # "rds".
-          format <- params$format %OR% "json"
-
-          values <- list()
-
-          if (!is.null(params$input)) {
-
-            allInputs <- isolate(
-              reactiveValuesToList(self$input, all.names = TRUE)
-            )
-
-            # If params$input is "1", return all; otherwise return just the
-            # inputs that are named in params$input, like "x,y,z".
-            if (params$input == "1") {
-              values$input <- allInputs
-            } else {
-              items <- strsplit(params$input, ",")[[1]]
-              items <- intersect(items, names(allInputs))
-              values$input <- allInputs[items]
-            }
-
-            values$input <- sortByName(values$input)
-          }
-
-          if (!is.null(params$output)) {
-
-            if (params$output == "1") {
-              values$output <- private$outputValues
-            } else {
-              items <- strsplit(params$output, ",")[[1]]
-              items <- intersect(items, names(private$outputValues))
-              values$output <- private$outputValues[items]
-            }
-
-            values$output <- sortByName(values$output)
-          }
-
-          if (!is.null(params$export)) {
-
-            if (params$export == "1") {
-              values$export <- isolate(
-                lapply(private$testExportExprs, function(item) {
-                  eval(item$expr, envir = item$env)
-                })
-              )
-            } else {
-              items <- strsplit(params$export, ",")[[1]]
-              items <- intersect(items, names(private$testExportExprs))
-              values$export <- isolate(
-                lapply(private$testExportExprs[items], function(item) {
-                  eval(item$expr, envir = item$env)
-                })
-              )
-            }
-
-            values$export <- sortByName(values$export)
-          }
-
-          # Make sure input, output, and export are all named lists (at this
-          # point, they could be unnamed if they are empty lists). This is so
-          # that the resulting object is represented as an object in JSON
-          # instead of an array, and so that the RDS data structure is of a
-          # consistent type.
-          values <- lapply(values, asNamedVector)
-
-          if (length(values) == 0) {
-            return(httpResponse(400, "text/plain",
-              "None of export, input, or output requested."
-            ))
-          }
-
-          if (identical(format, "json")) {
-            content <- toJSON(values, pretty = TRUE)
-            httpResponse(200, "application/json", content)
-
-          } else if (identical(format, "rds")) {
-            tmpfile <- tempfile("shinytest", fileext = ".rds")
-            saveRDS(values, tmpfile)
-            on.exit(unlink(tmpfile))
-
-            content <- readBin(tmpfile, "raw", n = file.info(tmpfile)$size)
-            httpResponse(200, "application/octet-stream", content)
-
-          } else {
-            httpResponse(400, "text/plain", paste("Invalid format requested:", format))
-          }
-        }
-      )
-    }
-  ),
-  public = list(
-    restoreContext = NULL,
-    progressStack = 'Stack', # Stack of progress objects
-    input       = 'reactivevalues', # Externally-usable S3 wrapper object for .input
-    output      = 'ANY',    # Externally-usable S3 wrapper object for .outputs
-    clientData  = 'reactivevalues', # Externally-usable S3 wrapper object for .clientData
-    token = 'character',  # Used to identify this instance in URLs
-    files = 'Map',        # For keeping track of files sent to client
-    downloads = 'Map',
-    closed = logical(0),
-    request = 'ANY',      # Websocket request object
-    singletons = character(0),  # Tracks singleton HTML fragments sent to the page
-    user = NULL,
-    groups = NULL,
-
-    initialize = function(websocket) {
-      private$websocket <- websocket
-      self$closed <- FALSE
-      # TODO: Put file upload context in user/app-specific dir if possible
-
-      private$invalidatedOutputValues <- Map$new()
-      private$invalidatedOutputErrors <- Map$new()
-      private$fileUploadContext <- FileUploadContext$new()
-      private$closedCallbacks <- Callbacks$new()
-      private$flushCallbacks <- Callbacks$new()
-      private$flushedCallbacks <- Callbacks$new()
-      private$inputReceivedCallbacks <- Callbacks$new()
-      private$.input      <- ReactiveValues$new()
-      private$.clientData <- ReactiveValues$new()
-      self$progressStack <- Stack$new()
-      self$files <- Map$new()
-      self$downloads <- Map$new()
-
-      self$input <- .createReactiveValues(private$.input, readonly=TRUE)
-      .setLabel(self$input, 'input')
-      self$clientData <- .createReactiveValues(private$.clientData, readonly=TRUE)
-      .setLabel(self$clientData, 'clientData')
-
-      self$output <- .createOutputWriter(self)
-
-      self$token <- createUniqueId(16)
-      private$.outputs <- list()
-      private$.outputOptions <- list()
-
-      private$bookmarkCallbacks <- Callbacks$new()
-      private$bookmarkedCallbacks <- Callbacks$new()
-      private$restoreCallbacks <- Callbacks$new()
-      private$restoredCallbacks <- Callbacks$new()
-      private$createBookmarkObservers()
-
-      private$testMode <- .globals$testMode
-      private$enableTestSnapshot()
-
-      private$registerSessionEndCallbacks()
-
-      if (!is.null(websocket$request$HTTP_SHINY_SERVER_CREDENTIALS)) {
-        try({
-          creds <- jsonlite::fromJSON(websocket$request$HTTP_SHINY_SERVER_CREDENTIALS)
-          self$user <- creds$user
-          self$groups <- creds$groups
-        }, silent=FALSE)
-      }
-
-      # session$request should throw an error if httpuv doesn't have
-      # websocket$request, but don't throw it until a caller actually
-      # tries to access session$request
-      delayedAssign('request', websocket$request, assign.env = self)
-
-      private$sendMessage(
-        config = list(
-          workerId = workerId(),
-          sessionId = self$token
-        )
-      )
-    },
-    rootScope = function() {
-      self
-    },
-    makeScope = function(namespace) {
-      ns <- NS(namespace)
-
-      # Private items for this scope. Can't be part of the scope object because
-      # `$<-.session_proxy` doesn't allow assignment on overidden names.
-      bookmarkCallbacks <- Callbacks$new()
-      restoreCallbacks  <- Callbacks$new()
-      restoredCallbacks <- Callbacks$new()
-      bookmarkExclude   <- character(0)
-
-      scope <- createSessionProxy(self,
-        input = .createReactiveValues(private$.input, readonly = TRUE, ns = ns),
-        output = .createOutputWriter(self, ns = ns),
-        sendInputMessage = function(inputId, message) {
-          .subset2(self, "sendInputMessage")(ns(inputId), message)
-        },
-        registerDataObj = function(name, data, filterFunc) {
-          .subset2(self, "registerDataObj")(ns(name), data, filterFunc)
-        },
-        ns = ns,
-        makeScope = function(namespace) {
-          self$makeScope(ns(namespace))
-        },
-
-        setBookmarkExclude = function(names) {
-          bookmarkExclude <<- names
-        },
-        getBookmarkExclude = function() {
-          bookmarkExclude
-        },
-        onBookmark = function(fun) {
-          if (!is.function(fun) || length(fun) != 1) {
-            stop("`fun` must be a function that takes one argument")
-          }
-          bookmarkCallbacks$register(fun)
-        },
-        onBookmarked = function(fun) {
-          stop("onBookmarked() can't be used in a module.")
-        },
-        onRestore = function(fun) {
-          if (!is.function(fun) || length(fun) != 1) {
-            stop("`fun` must be a function that takes one argument")
-          }
-          restoreCallbacks$register(fun)
-        },
-        onRestored = function(fun) {
-          if (!is.function(fun) || length(fun) != 1) {
-            stop("`fun` must be a function that takes one argument")
-          }
-          restoredCallbacks$register(fun)
-        },
-        exportTestValues = function(..., quoted_ = FALSE, env_ = parent.frame()) {
-          if (quoted_) {
-            dots <- list(...)
-          } else {
-            dots <- eval(substitute(alist(...)))
-          }
-
-          if (anyUnnamed(dots))
-            stop("exportTestValues: all arguments must be named.")
-
-          names(dots) <- vapply(names(dots), ns, character(1))
-
-          do.call(
-            .subset2(self, "exportTestValues"),
-            c(dots, quoted_ = TRUE, env_ = env_),
-            quote = TRUE
-          )
-        }
-      )
-
-      # Given a char vector, return a logical vector indicating which of those
-      # strings are names of things in the namespace.
-      filterNamespace <- function(x) {
-        nsString <- paste0(namespace, ns.sep)
-        substr(x, 1, nchar(nsString)) == nsString
-      }
-
-      # Given a char vector of namespaced names, return a char vector of corresponding
-      # names with namespace prefix removed.
-      unNamespace <- function(x) {
-        if (!all(filterNamespace(x))) {
-          stop("x contains strings(s) that do not have namespace prefix ", namespace)
-        }
-
-        nsString <- paste0(namespace, ns.sep)
-        substring(x, nchar(nsString) + 1)
-      }
-
-      # Given a restore state object (a list), return a modified version that's
-      # scoped to this namespace.
-      scopeRestoreState <- function(state) {
-        # State is a list. We need to copy and transform some things for the
-        # scope.
-        scopeState <- state
-        # `values` is an environment and we don't want to modify the original.
-        scopeState$values <- new.env(parent = emptyenv())
-
-        # Keep only inputs that are in the scope, and rename them
-        scopeState$input <- scopeState$input[filterNamespace(names(scopeState$input))]
-        names(scopeState$input) <- unNamespace(names(scopeState$input))
-
-        # Same for values. This is an environment so we have to handle a little
-        # differently.
-        origNames <- names(state$values)
-        origNames <- origNames[filterNamespace(origNames)]
-        lapply(origNames, function(origName) {
-          scopedName <- unNamespace(origName)
-          scopeState$values[[scopedName]] <- state$values[[origName]]
-        })
-
-        if (!is.null(state$dir)) {
-          dir <- file.path(state$dir, namespace)
-          if (dirExists(dir))
-            scopeState$dir <- dir
-        }
-
-        scopeState
-      }
-
-      # When scope is created, register these bookmarking callbacks on the main
-      # session object. They will invoke the scope's own callbacks, if any are
-      # present.
-      self$onBookmark(function(state) {
-        # Exit if no user-defined callbacks.
-        if (bookmarkCallbacks$count() == 0)
-          return()
-
-        scopeState <- ShinySaveState$new(scope$input, scope$getBookmarkExclude())
-
-        # Create subdir for this scope
-        if (!is.null(state$dir)) {
-          scopeState$dir <- file.path(state$dir, namespace)
-          res <- dir.create(scopeState$dir)
-          if (res == FALSE) {
-            stop("Error creating subdirectory for scope ", namespace)
-          }
-        }
-
-        # Invoke the callback on the scopeState object
-        bookmarkCallbacks$invoke(scopeState)
-
-        # Copy `values` from scopeState to state, adding namespace
-        if (length(scopeState$values) != 0) {
-          if (anyUnnamed(scopeState$values)) {
-            stop("All scope values in must be named.")
-          }
-
-          lapply(names(scopeState$values), function(origName) {
-            scopedName <- ns(origName)
-            state$values[[scopedName]] <- scopeState$values[[origName]]
-          })
-        }
-      })
-
-      self$onRestore(function(state) {
-        # Exit if no user-defined callbacks.
-        if (restoreCallbacks$count() == 0)
-          return()
-
-        scopeState <- scopeRestoreState(state)
-        # Invoke user callbacks
-        restoreCallbacks$invoke(scopeState)
-      })
-
-      self$onRestored(function(state) {
-        # Exit if no user-defined callbacks.
-        if (restoredCallbacks$count() == 0)
-          return()
-
-        scopeState <- scopeRestoreState(state)
-        # Invoke user callbacks
-        restoredCallbacks$invoke(scopeState)
-      })
-
-      scope
-    },
-    ns = function(id) {
-      NS(NULL, id)
-    },
-
-    # Freeze a value until the flush cycle completes
-    freezeValue = function(x, name) {
-      if (!is.reactivevalues(x))
-        stop("x must be a reactivevalues object")
-
-      impl <- .subset2(x, 'impl')
-      impl$freeze(name)
-      self$onFlushed(function() impl$thaw(name))
-    },
-
-    onSessionEnded = function(sessionEndedCallback) {
-      "Registers the given callback to be invoked when the session is closed
-      (i.e. the connection to the client has been severed). The return value
-      is a function which unregisters the callback. If multiple callbacks are
-      registered, the order in which they are invoked is not guaranteed."
-      return(private$closedCallbacks$register(sessionEndedCallback))
-    },
-    onEnded = function(endedCallback) {
-      "Synonym for onSessionEnded"
-      return(self$onSessionEnded(endedCallback))
-    },
-    onInputReceived = function(callback) {
-      "Registers the given callback to be invoked when the session receives
-      new data from the client."
-      return(private$inputReceivedCallbacks$register(callback))
-    },
-    unhandledError = function(e) {
-      self$close()
-    },
-    close = function() {
-      if (!self$closed) {
-        private$websocket$close()
-      }
-    },
-    wsClosed = function() {
-      self$closed <- TRUE
-      for (output in private$.outputs) {
-        output$suspend()
-      }
-      # ..stacktraceon matches with the top-level ..stacktraceoff..
-      private$closedCallbacks$invoke(onError = printError, ..stacktraceon = TRUE)
-      flushReact()
-      flushAllSessions()
-    },
-    isClosed = function() {
-      return(self$closed)
-    },
-    isEnded = function() {
-      return(self$isClosed())
-    },
-    setShowcase = function(value) {
-      private$showcase <- !is.null(value) && as.logical(value)
-    },
-
-    allowReconnect = function(value) {
-      if (!(identical(value, TRUE) || identical(value, FALSE) || identical(value, "force"))) {
-        stop('value must be TRUE, FALSE, or "force"')
-      }
-      private$write(toJSON(list(allowReconnect = value)))
-    },
-
-    defineOutput = function(name, func, label) {
-      "Binds an output generating function to this name. The function can either
-      take no parameters, or have named parameters for \\code{name} and
-      \\code{shinysession} (in the future this list may expand, so it is a good idea
-      to also include \\code{...} in your function signature)."
-
-      # jcheng 08/31/2012: User submitted an example of a dynamically calculated
-      # name not working unless name was eagerly evaluated. Yikes!
-      force(name)
-
-      # If overwriting an output object, suspend the previous copy of it
-      if (!is.null(private$.outputs[[name]])) {
-        private$.outputs[[name]]$suspend()
-      }
-
-      if (is.function(func)) {
-        funcFormals <- formals(func)
-        # ..stacktraceon matches with the top-level ..stacktraceoff.., because
-        # the observer we set up below has ..stacktraceon=FALSE
-        func <- wrapFunctionLabel(func, paste0("output$", name), ..stacktraceon = TRUE)
-        if (length(funcFormals) != 0) {
-          orig <- func
-          func <- function() {
-            orig(name=name, shinysession=self)
-          }
-        }
-
-        # Preserve source reference and file information when formatting the
-        # label for display in the reactive graph
-        srcref <- attr(label, "srcref")
-        srcfile <- attr(label, "srcfile")
-        label <- sprintf('output$%s', name)
-        attr(label, "srcref") <- srcref
-        attr(label, "srcfile") <- srcfile
-
-        obs <- observe(..stacktraceon = FALSE, {
-
-          private$sendMessage(recalculating = list(
-            name = name, status = 'recalculating'
-          ))
-
-          value <- tryCatch(
-            shinyCallingHandlers(func()),
-            shiny.custom.error = function(cond) {
-              if (isTRUE(getOption("show.error.messages"))) printError(cond)
-              structure(NULL, class = "try-error", condition = cond)
-            },
-            shiny.output.cancel = function(cond) {
-              structure(NULL, class = "cancel-output")
-            },
-            shiny.silent.error = function(cond) {
-              # Don't let shiny.silent.error go through the normal stop
-              # path of try, because we don't want it to print. But we
-              # do want to try to return the same looking result so that
-              # the code below can send the error to the browser.
-              structure(NULL, class = "try-error", condition = cond)
-            },
-            error = function(cond) {
-              if (isTRUE(getOption("show.error.messages"))) printError(cond)
-              if (getOption("shiny.sanitize.errors", FALSE)) {
-                cond <- simpleError(paste("An error has occurred. Check your",
-                                          "logs or contact the app author for",
-                                          "clarification."))
-              }
-              invisible(structure(NULL, class = "try-error", condition = cond))
-            },
-            finally = {
-              private$sendMessage(recalculating = list(
-                name = name, status = 'recalculated'
-              ))
-            }
-          )
-
-          if (inherits(value, "cancel-output")) {
-            return()
-          }
-
-          private$invalidatedOutputErrors$remove(name)
-          private$invalidatedOutputValues$remove(name)
-
-          if (inherits(value, 'try-error')) {
-            cond <- attr(value, 'condition')
-            type <- setdiff(class(cond), c('simpleError', 'error', 'condition'))
-            private$invalidatedOutputErrors$set(
-              name,
-              list(message = cond$message,
-                   call = utils::capture.output(print(cond$call)),
-                   type = if (length(type)) type))
-          }
-          else
-            private$invalidatedOutputValues$set(name, value)
-        }, suspended=private$shouldSuspend(name), label=label)
-
-        obs$onInvalidate(function() {
-          self$showProgress(name)
-        })
-
-        private$.outputs[[name]] <- obs
-        if (is.null(private$.outputOptions[[name]]))
-          private$.outputOptions[[name]] <- list()
-      }
-      else {
-        stop(paste("Unexpected", class(func), "output for", name))
-      }
-    },
-    flushOutput = function() {
-      if (self$isClosed())
-        return()
-
-      # Return TRUE if there's any stuff to send to the client.
-      hasPendingUpdates <- function() {
-        # Even though progressKeys isn't sent to the client, we use it in this
-        # check. This is because if it is non-empty, sending `values` to the
-        # client tells it that the flushReact loop is finished, and the client
-        # then knows to stop showing progress.
-        return(
-          length(private$progressKeys) != 0 ||
-          length(private$invalidatedOutputValues) != 0 ||
-          length(private$invalidatedOutputErrors) != 0 ||
-          length(private$inputMessageQueue) != 0
-        )
-      }
-
-      # ..stacktraceon matches with the top-level ..stacktraceoff..
-      private$flushCallbacks$invoke(..stacktraceon = TRUE)
-
-      # Schedule execution of onFlushed callbacks
-      on.exit({
-        # ..stacktraceon matches with the top-level ..stacktraceoff..
-        private$flushedCallbacks$invoke(..stacktraceon = TRUE)
-
-        # If one of the flushedCallbacks added anything to send to the client,
-        # or invalidated any observers, set up another flush cycle.
-        if (hasPendingUpdates() || .getReactiveEnvironment()$hasPendingFlush()) {
-          scheduleFlush()
-        }
-      })
-
-      if (!hasPendingUpdates()) {
-        return(invisible())
-      }
-
-      private$progressKeys <- character(0)
-      values <- as.list(private$invalidatedOutputValues)
-      private$invalidatedOutputValues <- Map$new()
-      errors <- as.list(private$invalidatedOutputErrors)
-      private$invalidatedOutputErrors <- Map$new()
-      inputMessages <- private$inputMessageQueue
-      private$inputMessageQueue <- list()
-
-      if (isTRUE(private$testMode)) {
-        private$storeOutputValues(mergeVectors(values, errors))
-      }
-
-      private$sendMessage(
-        errors = errors,
-        values = values,
-        inputMessages = inputMessages
-      )
-    },
-    showProgress = function(id) {
-      'Send a message to the client that recalculation of the output identified
-      by \\code{id} is in progress. There is currently no mechanism for
-      explicitly turning off progress for an output component; instead, all
-      progress is implicitly turned off when flushOutput is next called.'
-
-      # If app is already closed, be sure not to show progress, otherwise we
-      # will get an error because of the closed websocket
-      if (self$closed)
-        return()
-
-      if (id %in% private$progressKeys)
-        return()
-
-      private$progressKeys <- c(private$progressKeys, id)
-
-      self$sendProgress('binding', list(id = id))
-    },
-    sendProgress = function(type, message) {
-      private$sendMessage(
-        progress = list(type = type, message = message)
-      )
-    },
-    sendNotification = function(type, message) {
-      private$sendMessage(
-        notification = list(type = type, message = message)
-      )
-    },
-    sendModal = function(type, message) {
-      private$sendMessage(
-        modal = list(type = type, message = message)
-      )
-    },
-    dispatch = function(msg) {
-      method <- paste('@', msg$method, sep='')
-      func <- try(self[[method]], silent = TRUE)
-      if (inherits(func, 'try-error')) {
-        private$sendErrorResponse(msg, paste('Unknown method', msg$method))
-      }
-
-      value <- try(do.call(func, as.list(append(msg$args, msg$blobs))),
-                   silent=TRUE)
-      if (inherits(value, 'try-error')) {
-        private$sendErrorResponse(msg, conditionMessage(attr(value, 'condition')))
-      }
-      else {
-        private$sendResponse(msg, value)
-      }
-    },
-    sendBinaryMessage = function(type, message) {
-      typeBytes <- charToRaw(type)
-      if (length(typeBytes) > 255) {
-        stop("'type' argument is too long")
-      }
-      private$write(c(as.raw(length(typeBytes)), typeBytes, message))
-    },
-    sendCustomMessage = function(type, message) {
-      data <- list()
-      data[[type]] <- message
-      private$sendMessage(custom = data)
-    },
-    sendInputMessage = function(inputId, message) {
-      data <- list(id = inputId, message = message)
-
-      # Add to input message queue
-      private$inputMessageQueue[[length(private$inputMessageQueue) + 1]] <- data
-    },
-    onFlush = function(flushCallback, once = TRUE) {
-      if (!isTRUE(once)) {
-        return(private$flushCallbacks$register(flushCallback))
-      } else {
-        dereg <- private$flushCallbacks$register(function() {
-          dereg()
-          flushCallback()
-        })
-        return(dereg)
-      }
-    },
-    onFlushed = function(flushedCallback, once = TRUE) {
-      if (!isTRUE(once)) {
-        return(private$flushedCallbacks$register(flushedCallback))
-      } else {
-        dereg <- private$flushedCallbacks$register(function() {
-          dereg()
-          flushedCallback()
-        })
-        return(dereg)
-      }
-    },
-
     setBookmarkExclude = function(names) {
       private$bookmarkExclude <- names
     },
     getBookmarkExclude = function() {
-      private$bookmarkExclude
+      scopedExcludes <- lapply(private$getBookmarkExcludeFuns, function(f) f())
+      scopedExcludes <- unlist(scopedExcludes)
+
+      c(private$bookmarkExclude, scopedExcludes)
     },
+
     onBookmark = function(fun) {
       if (!is.function(fun) || length(fun) != 1) {
         stop("`fun` must be a function that takes one argument")
@@ -1396,8 +1643,40 @@ ShinySession <- R6Class(
         )
       )
     },
-    updateQueryString = function(queryString) {
-      private$sendMessage(updateQueryString = list(queryString = queryString))
+    sendInsertTab = function(inputId, liTag, divTag, menuName,
+                             target, position, select) {
+      private$sendMessage(
+        `shiny-insert-tab` = list(
+          inputId = inputId,
+          liTag = liTag,
+          divTag = divTag,
+          menuName = menuName,
+          target = target,
+          position = position,
+          select = select
+        )
+      )
+    },
+    sendRemoveTab = function(inputId, target) {
+      private$sendMessage(
+        `shiny-remove-tab` = list(
+          inputId = inputId,
+          target = target
+        )
+      )
+    },
+    sendChangeTabVisibility = function(inputId, target, type) {
+      private$sendMessage(
+        `shiny-change-tab-visibility` = list(
+          inputId = inputId,
+          target = target,
+          type = type
+        )
+      )
+    },
+    updateQueryString = function(queryString, mode) {
+      private$sendMessage(updateQueryString = list(
+        queryString = queryString, mode = mode))
     },
     resetBrush = function(brushId) {
       private$sendMessage(
@@ -1433,7 +1712,8 @@ ShinySession <- R6Class(
       fileData <- private$fileUploadContext$getUploadOperation(jobId)$finish()
       private$.input$set(inputId, fileData)
 
-      private$.input$setMeta(inputId, "shiny.serializer", serializerFileInput)
+      setSerializer(inputId, serializerFileInput)
+      snapshotPreprocessInput(inputId, snapshotPreprocessorFileInput)
 
       invisible()
     },
@@ -1476,9 +1756,30 @@ ShinySession <- R6Class(
         }
       }
 
+      # @description Only applicable to files uploaded via IE. When possible,
+      #   adds the appropriate extension to temporary files created by
+      #   \code{mime::parse_multipart}.
+      # @param multipart A named list as returned by
+      #   \code{mime::parse_multipart}
+      # @return A named list with datapath updated to point to the new location
+      #   of the file, if an extension was added.
+      maybeMoveIEUpload <- function(multipart) {
+        if (is.null(multipart)) return(NULL)
+
+        lapply(multipart, function(input) {
+          oldPath <- input$datapath
+          newPath <- paste0(oldPath, maybeGetExtension(input$name))
+          if (oldPath != newPath) {
+            file.rename(oldPath, newPath)
+            input$datapath <- newPath
+          }
+          input
+        })
+      }
+
       if (matches[2] == 'uploadie' && identical(req$REQUEST_METHOD, "POST")) {
         id <- URLdecode(matches[3])
-        res <- mime::parse_multipart(req)
+        res <- maybeMoveIEUpload(mime::parse_multipart(req))
         private$.input$set(id, res[[id]])
         return(httpResponse(200, 'text/plain', 'OK'))
       }
@@ -1538,32 +1839,44 @@ ShinySession <- R6Class(
         if (nzchar(ext))
           ext <- paste(".", ext, sep = "")
         tmpdata <- tempfile(fileext = ext)
-        # ..stacktraceon matches with the top-level ..stacktraceoff..
-        result <- try(shinyCallingHandlers(Context$new(getDefaultReactiveDomain(), '[download]')$run(
-          function() { ..stacktraceon..(download$func(tmpdata)) }
-        )), silent = TRUE)
-        if (inherits(result, 'try-error')) {
-          unlink(tmpdata)
-          stop(attr(result, "condition", exact = TRUE))
-        }
-        if (!file.exists(tmpdata)) {
-          # If no file was created, return a 404
-          return(httpResponse(404, content = "404 Not found"))
-        }
-        return(httpResponse(
-          200,
-          download$contentType %OR% getContentType(filename),
-          # owned=TRUE means tmpdata will be deleted after response completes
-          list(file=tmpdata, owned=TRUE),
-          c(
-            'Content-Disposition' = ifelse(
-              dlmatches[3] == '',
-              'attachment; filename="' %.%
-                gsub('(["\\\\])', '\\\\\\1', filename) %.%  # yes, that many \'s
-                '"',
-              'attachment'
-            ),
-            'Cache-Control'='no-cache')))
+        return(Context$new(getDefaultReactiveDomain(), '[download]')$run(function() {
+          promises::with_promise_domain(reactivePromiseDomain(), {
+            promises::with_promise_domain(createStackTracePromiseDomain(), {
+              self$incrementBusyCount()
+              hybrid_chain(
+                # ..stacktraceon matches with the top-level ..stacktraceoff..
+                try(..stacktraceon..(download$func(tmpdata)), silent = TRUE),
+                function(result) {
+                  if (inherits(result, 'try-error')) {
+                    unlink(tmpdata)
+                    stop(attr(result, "condition", exact = TRUE))
+                  }
+                  if (!file.exists(tmpdata)) {
+                    # If no file was created, return a 404
+                    return(httpResponse(404, content = "404 Not found"))
+                  }
+                  return(httpResponse(
+                    200,
+                    download$contentType %OR% getContentType(filename),
+                    # owned=TRUE means tmpdata will be deleted after response completes
+                    list(file=tmpdata, owned=TRUE),
+                    c(
+                      'Content-Disposition' = ifelse(
+                        dlmatches[3] == '',
+                        'attachment; filename="' %.%
+                          gsub('(["\\\\])', '\\\\\\1', filename) %.%  # yes, that many \'s
+                          '"',
+                        'attachment'
+                      ),
+                      'Cache-Control'='no-cache')))
+                },
+                finally = function() {
+                  self$decrementBusyCount()
+                }
+              )
+            })
+          })
+        }))
       }
 
       if (matches[2] == 'dataobj') {
@@ -1628,9 +1941,13 @@ ShinySession <- R6Class(
     },
     # This function suspends observers for hidden outputs and resumes observers
     # for un-hidden outputs.
-    manageHiddenOutputs = function() {
+    manageHiddenOutputs = function(outputsToCheck = NULL) {
+      if (is.null(outputsToCheck)) {
+        outputsToCheck <- names(private$.outputs)
+      }
+
       # Find hidden state for each output, and suspend/resume accordingly
-      for (outputName in names(private$.outputs)) {
+      for (outputName in outputsToCheck) {
         if (private$shouldSuspend(outputName)) {
           private$.outputs[[outputName]]$suspend()
         } else {
@@ -1638,24 +1955,39 @@ ShinySession <- R6Class(
         }
       }
     },
-    # Set the normal and client data input variables
-    manageInputs = function(data) {
+    # Set the normal and client data input variables. Normally, managing
+    # inputs doesn't take immediate effect when there are observers that
+    # are pending execution or currently executing (including having
+    # started async operations that have yielded control, but not yet
+    # completed). The `now` argument can force this. It should generally
+    # not be used, but we're adding it to get around a show-stopping bug
+    # for Shiny v1.1 (see the call site for more details).
+    manageInputs = function(data, now = FALSE) {
+      force(data)
+      doManageInputs <- function() {
+        private$inputReceivedCallbacks$invoke(data)
 
-      private$inputReceivedCallbacks$invoke(data)
+        data_names <- names(data)
 
-      data_names <- names(data)
+        # Separate normal input variables from client data input variables
+        clientdata_idx <- grepl("^.clientdata_", data_names)
 
-      # Separate normal input variables from client data input variables
-      clientdata_idx <- grepl("^.clientdata_", data_names)
+        # Set normal (non-clientData) input values
+        private$.input$mset(data[data_names[!clientdata_idx]])
 
-      # Set normal (non-clientData) input values
-      private$.input$mset(data[data_names[!clientdata_idx]])
+        # Strip off .clientdata_ from clientdata input names, and set values
+        input_clientdata <- data[data_names[clientdata_idx]]
+        names(input_clientdata) <- sub("^.clientdata_", "",
+          names(input_clientdata))
+        private$.clientData$mset(input_clientdata)
 
-      # Strip off .clientdata_ from clientdata input names, and set values
-      input_clientdata <- data[data_names[clientdata_idx]]
-      names(input_clientdata) <- sub("^.clientdata_", "",
-                                     names(input_clientdata))
-      private$.clientData$mset(input_clientdata)
+        self$manageHiddenOutputs()
+      }
+      if (isTRUE(now)) {
+        doManageInputs()
+      } else {
+        self$cycleStartAction(doManageInputs)
+      }
     },
     outputOptions = function(name, ...) {
       # If no name supplied, return the list of options for all outputs
@@ -1680,7 +2012,7 @@ ShinySession <- R6Class(
 
       # If any changes to suspendWhenHidden, need to re-run manageHiddenOutputs
       if ("suspendWhenHidden" %in% names(opts)) {
-        self$manageHiddenOutputs()
+        self$manageHiddenOutputs(name)
       }
 
       if ("priority" %in% names(opts)) {
@@ -1691,6 +2023,7 @@ ShinySession <- R6Class(
     },
     incrementBusyCount = function() {
       if (private$busyCount == 0L) {
+        rLog$asyncStart(domain = self)
         private$sendMessage(busy = "busy")
       }
       private$busyCount <- private$busyCount + 1L
@@ -1698,7 +2031,21 @@ ShinySession <- R6Class(
     decrementBusyCount = function() {
       private$busyCount <- private$busyCount - 1L
       if (private$busyCount == 0L) {
+        rLog$asyncStop(domain = self)
         private$sendMessage(busy = "idle")
+        self$requestFlush()
+        # We defer the call to startCycle() using later(), to defend against
+        # cycles where we continually call startCycle which causes an observer
+        # to fire which calls startCycle which causes an observer to fire...
+        #
+        # It's OK for these cycles to occur, but we must return control to the
+        # event loop between iterations (or at least sometimes) in order to not
+        # make the whole Shiny app go unresponsive.
+        later::later(function() {
+          if (private$busyCount == 0L) {
+            private$startCycle()
+          }
+        })
       }
     }
   ),
@@ -1804,6 +2151,15 @@ outputOptions <- function(x, name, ...) {
 }
 
 
+#' Get information about the output that is currently being executed.
+#'
+#' @param session The current Shiny session.
+#'
+#' @export
+getCurrentOutputInfo <- function(session = getDefaultReactiveDomain()) {
+  session$getCurrentOutputInfo()
+}
+
 #' Add callbacks for Shiny session events
 #'
 #' These functions are for registering callbacks on Shiny session events.
@@ -1835,18 +2191,17 @@ onFlushed <- function(fun, once = TRUE, session = getDefaultReactiveDomain()) {
 }
 
 #' @rdname onFlush
+#'
+#' @seealso \code{\link{onStop}()} for registering callbacks that will be
+#'   invoked when the application exits, or when a session ends.
 #' @export
 onSessionEnded <- function(fun, session = getDefaultReactiveDomain()) {
   session$onSessionEnded(fun)
 }
 
 
-scheduleFlush <- function() {
-  timerCallbacks$schedule(0, function() {})
-}
-
-flushAllSessions <- function() {
-  lapply(appsByToken$values(), function(shinysession) {
+flushPendingSessions <- function() {
+  lapply(appsNeedingFlush$values(), function(shinysession) {
     tryCatch(
       shinysession$flushOutput(),
 
@@ -1859,3 +2214,133 @@ flushAllSessions <- function() {
     NULL
   })
 }
+
+.globals$onStopCallbacks <- Callbacks$new()
+
+#' Run code after an application or session ends
+#'
+#' This function registers callback functions that are invoked when the
+#' application exits (when \code{\link{runApp}} exits), or after each user
+#' session ends (when a client disconnects).
+#'
+#' @param fun A function that will be called after the app has finished running.
+#' @param session A scope for when the callback will run. If \code{onStop} is
+#'   called from within the server function, this will default to the current
+#'   session, and the callback will be invoked when the current session ends. If
+#'   \code{onStop} is called outside a server function, then the callback will
+#'   be invoked with the application exits. If \code{NULL}, it is the same as
+#'   calling \code{onStop} outside of the server function, and the callback will
+#'   be invoked when the application exits.
+#'
+#'
+#' @seealso \code{\link{onSessionEnded}()} for the same functionality, but at
+#'   the session level only.
+#'
+#' @return A function which, if invoked, will cancel the callback.
+#' @examples
+#' ## Only run this example in interactive R sessions
+#' if (interactive()) {
+#'   # Open this application in multiple browsers, then close the browsers.
+#'   shinyApp(
+#'     ui = basicPage("onStop demo"),
+#'
+#'     server = function(input, output, session) {
+#'       onStop(function() cat("Session stopped\n"))
+#'     },
+#'
+#'     onStart = function() {
+#'       cat("Doing application setup\n")
+#'
+#'       onStop(function() {
+#'         cat("Doing application cleanup\n")
+#'       })
+#'     }
+#'   )
+#' }
+#' # In the example above, onStop() is called inside of onStart(). This is
+#' # the pattern that should be used when creating a shinyApp() object from
+#' # a function, or at the console. If instead you are writing an app.R which
+#' # will be invoked with runApp(), you can do it that way, or put the onStop()
+#' # before the shinyApp() call, as shown below.
+#'
+#' \dontrun{
+#' # ==== app.R ====
+#' cat("Doing application setup\n")
+#' onStop(function() {
+#'   cat("Doing application cleanup\n")
+#' })
+#'
+#' shinyApp(
+#'   ui = basicPage("onStop demo"),
+#'
+#'   server = function(input, output, session) {
+#'     onStop(function() cat("Session stopped\n"))
+#'   }
+#' )
+#' # ==== end app.R ====
+#'
+#'
+#' # Similarly, if you have a global.R, you can call onStop() from there.
+#' # ==== global.R ====
+#' cat("Doing application setup\n")
+#' onStop(function() {
+#'   cat("Doing application cleanup\n")
+#' })
+#' # ==== end global.R ====
+#' }
+#' @export
+onStop <- function(fun, session = getDefaultReactiveDomain()) {
+  if (is.null(session)) {
+    return(.globals$onStopCallbacks$register(fun))
+  } else {
+    # Note: In the future if we allow scoping the onStop() callback to modules
+    # and allow modules to be stopped, then session_proxy objects will need
+    # its own implementation of $onSessionEnded.
+    return(session$onSessionEnded(fun))
+  }
+}
+
+# Helper class for emitting log messages to stdout that will be interpreted by
+# a Shiny Server parent process. The duration it's trying to record is the time
+# between a websocket message being received, and the next flush to the client.
+ShinyServerTimingRecorder <- R6Class("ShinyServerTimingRecorder",
+  cloneable = FALSE,
+  public = list(
+    initialize = function() {
+      private$shiny_stdout <- if (exists(".shiny__stdout", globalenv()))
+        get(".shiny__stdout", globalenv())
+      else
+        NULL
+      private$guid <- NULL
+    },
+    start = function(guid) {
+      if (is.null(private$shiny_stdout)) return()
+
+      private$guid <- guid
+      if (!is.null(guid)) {
+        private$write("n")
+      }
+    },
+    stop = function() {
+      if (is.null(private$shiny_stdout)) return()
+
+      if (!is.null(private$guid)) {
+        private$write("x")
+        private$guid <- NULL
+      }
+    }
+  ),
+  private = list(
+    shiny_stdout = NULL,
+    guid = character(),
+    write = function(code) {
+      # eNter or eXit a flushReact
+      writeLines(paste("_", code, "_flushReact ", private$guid,
+        " @ ", sprintf("%.3f", as.numeric(Sys.time())),
+        sep=""), con=private$shiny_stdout)
+      flush(private$shiny_stdout)
+    }
+  )
+)
+
+missingOutput <- function(...) req(FALSE)

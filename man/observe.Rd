@@ -5,8 +5,9 @@
 \title{Create a reactive observer}
 \usage{
 observe(x, env = parent.frame(), quoted = FALSE, label = NULL,
-  suspended = FALSE, priority = 0, domain = getDefaultReactiveDomain(),
-  autoDestroy = TRUE, ..stacktraceon = TRUE)
+  suspended = FALSE, priority = 0,
+  domain = getDefaultReactiveDomain(), autoDestroy = TRUE,
+  ..stacktraceon = TRUE)
 }
 \arguments{
 \item{x}{An expression (quoted or unquoted). Any return value will be
@@ -116,4 +117,3 @@ obsD <- observe(expr_q, quoted = TRUE)
 # are at the console, you can force a flush with flushReact()
 shiny:::flushReact()
 }
-

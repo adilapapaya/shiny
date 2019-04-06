@@ -42,7 +42,7 @@ list, but when \code{size} is set, it will be a box instead.}
 \item{...}{Arguments passed to \code{selectInput()}.}
 
 \item{options}{A list of options. See the documentation of \pkg{selectize.js}
-for possible options (character option values inside \code{\link{I}()} will
+for possible options (character option values inside \code{\link[base]{I}()} will
 be treated as literal JavaScript code; see \code{\link{renderDataTable}()}
 for details).}
 }
@@ -56,7 +56,7 @@ from a list of values.
 \details{
 By default, \code{selectInput()} and \code{selectizeInput()} use the
 JavaScript library \pkg{selectize.js}
-(\url{https://github.com/brianreavis/selectize.js}) to instead of the basic
+(\url{https://github.com/selectize/selectize.js}) to instead of the basic
 select input element. To use the standard HTML select input element, use
 \code{selectInput()} with \code{selectize=FALSE}.
 
@@ -98,9 +98,9 @@ shinyApp(
 shinyApp(
   ui = fluidPage(
     selectInput("state", "Choose a state:",
-      list(`East Coast` = c("NY", "NJ", "CT"),
-           `West Coast` = c("WA", "OR", "CA"),
-           `Midwest` = c("MN", "WI", "IA"))
+      list(`East Coast` = list("NY", "NJ", "CT"),
+           `West Coast` = list("WA", "OR", "CA"),
+           `Midwest` = list("MN", "WI", "IA"))
     ),
     textOutput("result")
   ),
@@ -113,15 +113,15 @@ shinyApp(
 }
 }
 \seealso{
-\code{\link{updateSelectInput}}
+\code{\link{updateSelectInput}} \code{\link{varSelectInput}}
 
-Other input.elements: \code{\link{actionButton}},
+Other input elements: \code{\link{actionButton}},
   \code{\link{checkboxGroupInput}},
   \code{\link{checkboxInput}}, \code{\link{dateInput}},
   \code{\link{dateRangeInput}}, \code{\link{fileInput}},
   \code{\link{numericInput}}, \code{\link{passwordInput}},
   \code{\link{radioButtons}}, \code{\link{sliderInput}},
   \code{\link{submitButton}}, \code{\link{textAreaInput}},
-  \code{\link{textInput}}
+  \code{\link{textInput}}, \code{\link{varSelectInput}}
 }
-
+\concept{input elements}

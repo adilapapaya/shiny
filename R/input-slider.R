@@ -36,7 +36,7 @@
 #'   format string, to be passed to the Javascript strftime library. See
 #'   \url{https://github.com/samsonjs/strftime} for more details. The allowed
 #'   format specifications are very similar, but not identical, to those for R's
-#'   \code{\link{strftime}} function. For Dates, the default is \code{"\%F"}
+#'   \code{\link[base]{strftime}} function. For Dates, the default is \code{"\%F"}
 #'   (like \code{"2015-07-01"}), and for POSIXt, the default is \code{"\%F \%T"}
 #'   (like \code{"2015-07-01 15:32:10"}).
 #' @param timezone Only used if the values are POSIXt objects. A string
@@ -51,6 +51,7 @@
 #' @examples
 #' ## Only run examples in interactive R sessions
 #' if (interactive()) {
+#' options(device.ask.default = FALSE)
 #'
 #' ui <- fluidPage(
 #'   sliderInput("obs", "Number of observations:",
@@ -85,40 +86,25 @@ sliderInput <- function(inputId, label, min, max, value, step = NULL,
                     version = "0.10.2.2")
   }
 
-  value <- restoreInput(id = inputId, default = value)
+  dataType <- getSliderType(min, max, value)
 
-  # If step is NULL, use heuristic to set the step size.
-  findStepSize <- function(min, max, step) {
-    if (!is.null(step)) return(step)
-
-    range <- max - min
-    # If short range or decimals, use continuous decimal with ~100 points
-    if (range < 2 || hasDecimals(min) || hasDecimals(max)) {
-      step <- pretty(c(min, max), n = 100)
-      step[2] - step[1]
-    } else {
-      1
-    }
+  if (is.null(timeFormat)) {
+    timeFormat <- switch(dataType, date = "%F", datetime = "%F %T", number = NULL)
   }
 
-  if (inherits(min, "Date")) {
-    if (!inherits(max, "Date") || !inherits(value, "Date"))
-      stop("`min`, `max`, and `value must all be Date or non-Date objects")
-    dataType <- "date"
+  # Restore bookmarked values here, after doing the type checking, because the
+  # restored value will be a character vector instead of Date or POSIXct, and we can do
+  # the conversion to correct type next.
+  value <- restoreInput(id = inputId, default = value)
 
-    if (is.null(timeFormat))
-      timeFormat <- "%F"
-
-  } else if (inherits(min, "POSIXt")) {
-    if (!inherits(max, "POSIXt") || !inherits(value, "POSIXt"))
-      stop("`min`, `max`, and `value must all be POSIXt or non-POSIXt objects")
-    dataType <- "datetime"
-
-    if (is.null(timeFormat))
-      timeFormat <- "%F %T"
-
-  } else {
-    dataType <- "number"
+  if (is.character(value)) {
+    # If we got here, the value was restored from a URL-encoded bookmark.
+    if (dataType == "date") {
+      value <- as.Date(value, format = "%Y-%m-%d")
+    } else if (dataType == "datetime") {
+      # Date-times will have a format like "2018-02-28T03:46:26Z"
+      value <- as.POSIXct(value, format = "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+    }
   }
 
   step <- findStepSize(min, max, step)
@@ -163,22 +149,19 @@ sliderInput <- function(inputId, label, min, max, value, step = NULL,
     `data-grid` = ticks,
     `data-grid-num` = n_ticks,
     `data-grid-snap` = FALSE,
+    `data-prettify-separator` = sep,
+    `data-prettify-enabled` = (sep != ""),
     `data-prefix` = pre,
     `data-postfix` = post,
     `data-keyboard` = TRUE,
-    `data-keyboard-step` = step / (max - min) * 100,
-    `data-drag-interval` = dragRange,
+    # This value is only relevant for range sliders; for non-range sliders it
+    # causes problems since ion.RangeSlider 2.1.2 (issue #1605).
+    `data-drag-interval` = if (length(value) > 1) dragRange,
     # The following are ignored by the ion.rangeSlider, but are used by Shiny.
     `data-data-type` = dataType,
     `data-time-format` = timeFormat,
     `data-timezone` = timezone
   ))
-
-  if (sep == "") {
-    sliderProps$`data-prettify-enabled` <- "0"
-  } else {
-    sliderProps$`data-prettify-separator` <- sep
-  }
 
   # Replace any TRUE and FALSE with "true" and "false"
   sliderProps <- lapply(sliderProps, function(x) {
@@ -219,7 +202,7 @@ sliderInput <- function(inputId, label, min, max, value, step = NULL,
   }
 
   dep <- list(
-    htmlDependency("ionrangeslider", "2.1.2", c(href="shared/ionrangeslider"),
+    htmlDependency("ionrangeslider", "2.1.6", c(href="shared/ionrangeslider"),
       script = "js/ion.rangeSlider.min.js",
       # ion.rangeSlider also needs normalize.css, which is already included in
       # Bootstrap.
@@ -238,6 +221,34 @@ hasDecimals <- function(value) {
   truncatedValue <- round(value)
   return (!identical(value, truncatedValue))
 }
+
+
+# If step is NULL, use heuristic to set the step size.
+findStepSize <- function(min, max, step) {
+  if (!is.null(step)) return(step)
+
+  range <- max - min
+  # If short range or decimals, use continuous decimal with ~100 points
+  if (range < 2 || hasDecimals(min) || hasDecimals(max)) {
+    # Workaround for rounding errors (#1006): the intervals between the items
+    # returned by pretty() can have rounding errors. To avoid this, we'll use
+    # pretty() to find the min, max, and number of steps, and then use those
+    # values to calculate the step size.
+    pretty_steps <- pretty(c(min, max), n = 100)
+    n_steps <- length(pretty_steps) - 1
+
+    # Fix for #2061: Windows has low-significance digits (like 17 digits out)
+    # even at the boundaries of pretty()'s output. Use signif(digits = 10),
+    # which should be way way less significant than any data we'd want to keep.
+    # It might make sense to use signif(steps[2] - steps[1], 10) instead, but
+    # for now trying to make the minimal change.
+    signif(digits = 10, (max(pretty_steps) - min(pretty_steps)) / n_steps)
+
+  } else {
+    1
+  }
+}
+
 
 #' @rdname sliderInput
 #'
